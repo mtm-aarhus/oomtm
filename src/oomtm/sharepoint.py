@@ -313,6 +313,40 @@ def delete_file(ctx: "ClientContext", file_path: str) -> None:
     file.delete_object().execute_query()
 
 
+def delete_folder_recursive(ctx: "ClientContext", folder_path: str) -> bool:
+    """Delete a folder and everything under it, bottom-up: files first, then
+    subfolders (recursively), then the folder itself.
+
+    Returns True if the folder existed and was deleted, False if it wasn't
+    there to begin with. Other errors propagate.
+    """
+    if not folder_exists(ctx, folder_path):
+        return False
+    _delete_folder_contents(ctx, folder_path)
+    ctx.web.get_folder_by_server_relative_url(folder_path).delete_object().execute_query()
+    return True
+
+
+def _delete_folder_contents(ctx: "ClientContext", folder_path: str) -> None:
+    folder = ctx.web.get_folder_by_server_relative_url(folder_path)
+    files = folder.files
+    subfolders = folder.folders
+    ctx.load(files)
+    ctx.load(subfolders)
+    ctx.execute_query()
+
+    for f in files:
+        f.delete_object()
+    ctx.execute_query()
+
+    for sub in subfolders:
+        sub_path = sub.properties.get("ServerRelativeUrl")
+        if not sub_path:
+            continue
+        _delete_folder_contents(ctx, sub_path)
+        ctx.web.get_folder_by_server_relative_url(sub_path).delete_object().execute_query()
+
+
 # ---------------------------------------------------------------------------
 # High-level convenience
 # ---------------------------------------------------------------------------
