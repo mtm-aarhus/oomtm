@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import re
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 if TYPE_CHECKING:
     from office365.sharepoint.client_context import ClientContext
@@ -53,6 +53,25 @@ def sanitize_title(title: str) -> str:
     s = s.replace("\n", "").replace("\r", "")
     s = s.strip()
     s = _NON_ALLOWED.sub("", s)
+    s = _MULTI_SPACE.sub(" ", s)
+    return s
+
+
+_SP_FORBIDDEN = re.compile(r'[~"#%&*:<>?/\\{}|]')
+
+
+def sanitize_segment(s: str) -> str:
+    """Light sanitization for a folder name or case number that must stay
+    readable — removes only the characters SharePoint Online forbids in path
+    segments, but KEEPS hyphens, underscores, dots and Danish letters.
+
+    Use this for folder names (case folders, GO/Nova case numbers like
+    ``GEO-2024-000170``); use ``sanitize_title`` for the document *title* part
+    of a filename, where the legacy robots stripped punctuation entirely.
+    """
+    s = _SP_FORBIDDEN.sub("", str(s or ""))
+    s = s.replace("\n", " ").replace("\r", " ").strip()
+    s = s.strip(".").strip()
     s = _MULTI_SPACE.sub(" ", s)
     return s
 
@@ -292,6 +311,44 @@ def delete_file(ctx: "ClientContext", file_path: str) -> None:
     """Delete a single file from SharePoint."""
     file = ctx.web.get_file_by_server_relative_url(file_path)
     file.delete_object().execute_query()
+
+
+# ---------------------------------------------------------------------------
+# High-level convenience
+# ---------------------------------------------------------------------------
+
+
+def upload_to_case_folder(
+    ctx: "ClientContext",
+    *,
+    site_url: str,
+    library: str,
+    overmappe: str,
+    undermappe: str,
+    local_file: str,
+    overwrite: bool = True,
+) -> str:
+    """Ensure ``library/overmappe/undermappe`` exists and upload ``local_file``
+    into it. Returns the file's server-relative path.
+
+    This is the one-call path the KontAKT ToPDF robots use: build folder path →
+    ensure both folder levels exist → (chunked) upload.
+    """
+    parent = build_server_relative_path(site_url, library)
+    folder_path = ensure_folder(ctx, parent_path=parent, segments=[overmappe, undermappe])
+    upload_file(ctx, folder_path=folder_path, local_file=local_file, overwrite=overwrite)
+    return f"{folder_path}/{os.path.basename(local_file)}"
+
+
+def file_browser_url(site_url: str, file_server_relative_path: str) -> str:
+    """Build a clickable browser URL from a server-relative file path.
+
+    ``site_url`` e.g. ``https://aarhuskommune.sharepoint.com/Teams/tea-teamsite12593``;
+    ``file_server_relative_path`` e.g. ``/Teams/tea-teamsite12593/Delte dokumenter/.../x.pdf``.
+    """
+    parsed = urlparse(site_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return origin + quote(file_server_relative_path)
 
 
 # ---------------------------------------------------------------------------

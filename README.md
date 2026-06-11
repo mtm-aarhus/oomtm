@@ -9,7 +9,7 @@ Centralises the gnarly integration code we used to copy-paste across robots:
 | `oomtm.sharepoint` | SharePoint Online cert auth, folder create/delete, chunked upload/download, share-link generation, plus filename sanitization and path-length truncation tailored to SharePoint Online's 400-char URL limit. |
 | `oomtm.go` | GO API: NTLM session, document metadata, chunked download with the `ows_EncodedAbsUrl` fallback for files >10 MB, server-side PDF conversion. |
 | `oomtm.nova` | KMD Nova: DigiCert-intermediate-aware TLS wrapper (`nova_request`), bearer-token refresh with 90-min cache helper, document list + sub-document expansion, file download. |
-| `oomtm.pdf` *(planned)* | LibreOffice headless conversion, photo→PDF, Tesseract OCR (dan+eng), PyMuPDF true redaction, metadata scrubbing. |
+| `oomtm.pdf` | PDF conversion: LibreOffice headless (office/text/html), Pillow (images), `.msg`/`.eml`→HTML→PDF. `ensure_libreoffice()` auto-installs LibreOffice on the worker (winget/choco/apt, concurrency-locked) on first use. OCR + PyMuPDF redaction land here later. Install with the `[pdf]` extra. |
 
 ## Design
 
