@@ -277,6 +277,170 @@ def office_to_pdf(
 
 
 # ---------------------------------------------------------------------------
+# Microsoft Office (COM automation) — higher fidelity than LibreOffice for
+# Word/Excel/PowerPoint. Windows + installed Office + pywin32 only. Used in
+# preference to LibreOffice when available; LibreOffice remains the fallback.
+#
+# NB: these documents come from external citizens, so macros are force-disabled
+# (AutomationSecurity = msoAutomationSecurityForceDisable = 3) before opening.
+# COM automation expects a usable session — fine for an interactive/unattended
+# RPA login, less so for a bare service account.
+# ---------------------------------------------------------------------------
+
+_MSOFFICE_APP = {}
+for _e in ("doc", "docx", "docm", "dot", "dotx", "rtf", "odt", "txt", "htm", "html"):
+    _MSOFFICE_APP[_e] = "word"
+for _e in ("xls", "xlsx", "xlsm", "xlsb", "xltx", "csv", "ods"):
+    _MSOFFICE_APP[_e] = "excel"
+for _e in ("ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp"):
+    _MSOFFICE_APP[_e] = "powerpoint"
+
+_MSO_SECURITY_FORCE_DISABLE = 3  # msoAutomationSecurityForceDisable
+_WD_EXPORT_PDF = 17              # wdExportFormatPDF
+_XL_TYPE_PDF = 0                 # xlTypePDF
+_PP_SAVE_AS_PDF = 32             # ppSaveAsPDF
+
+
+def _word_to_pdf(src_abs: str, out_abs: str) -> bool:
+    import win32com.client as win32
+    word = doc = None
+    try:
+        word = win32.DispatchEx("Word.Application")
+        word.Visible = False
+        for setter in (lambda: setattr(word, "DisplayAlerts", 0),
+                       lambda: setattr(word, "AutomationSecurity", _MSO_SECURITY_FORCE_DISABLE)):
+            try:
+                setter()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        doc = word.Documents.Open(src_abs, ReadOnly=True, ConfirmConversions=False, AddToRecentFiles=False)
+        doc.ExportAsFixedFormat(out_abs, _WD_EXPORT_PDF)
+        return True
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+
+def _excel_to_pdf(src_abs: str, out_abs: str) -> bool:
+    import win32com.client as win32
+    excel = wb = None
+    try:
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        for setter in (lambda: setattr(excel, "DisplayAlerts", False),
+                       lambda: setattr(excel, "AutomationSecurity", _MSO_SECURITY_FORCE_DISABLE)):
+            try:
+                setter()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        wb = excel.Workbooks.Open(src_abs, ReadOnly=True, UpdateLinks=0)
+        wb.ExportAsFixedFormat(_XL_TYPE_PDF, out_abs)
+        return True
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(False)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+
+def _ppt_to_pdf(src_abs: str, out_abs: str) -> bool:
+    import win32com.client as win32
+    ppt = pres = None
+    try:
+        ppt = win32.DispatchEx("PowerPoint.Application")
+        # PowerPoint refuses Visible=False; open the file windowless instead.
+        try:
+            ppt.AutomationSecurity = _MSO_SECURITY_FORCE_DISABLE
+        except Exception:  # pylint: disable=broad-except
+            pass
+        pres = ppt.Presentations.Open(src_abs, WithWindow=False, ReadOnly=True)
+        pres.SaveAs(out_abs, _PP_SAVE_AS_PDF)
+        return True
+    finally:
+        try:
+            if pres is not None:
+                pres.Close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            if ppt is not None:
+                ppt.Quit()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+
+def msoffice_available(ext: str) -> bool:
+    """Whether MS Office COM conversion is plausible for this extension here
+    (Windows + pywin32 importable + a known Office app for the extension).
+    Doesn't actually launch Office — failures still fall back at convert time."""
+    if not sys.platform.startswith("win"):
+        return False
+    if _MSOFFICE_APP.get((ext or "").lower().lstrip(".")) is None:
+        return False
+    try:
+        import win32com.client  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def msoffice_to_pdf(src: str | Path, out_path: str | Path, *, log=None) -> Path | None:
+    """Convert a Word/Excel/PowerPoint file to PDF via the installed Office.
+    Returns the PDF path, or None if Office isn't usable / the conversion failed
+    (so the caller can fall back to LibreOffice)."""
+    log = log or (lambda *_: None)
+    ext = Path(src).suffix.lower().lstrip(".")
+    app = _MSOFFICE_APP.get(ext)
+    if not app or not sys.platform.startswith("win"):
+        return None
+    try:
+        import pythoncom
+    except ImportError:
+        return None
+
+    out_path = Path(out_path)
+    src_abs = str(Path(src).resolve())
+    out_abs = str(out_path.resolve())
+    if out_path.exists():
+        out_path.unlink()
+
+    pythoncom.CoInitialize()
+    try:
+        if app == "word":
+            ok = _word_to_pdf(src_abs, out_abs)
+        elif app == "excel":
+            ok = _excel_to_pdf(src_abs, out_abs)
+        else:
+            ok = _ppt_to_pdf(src_abs, out_abs)
+    except Exception as exc:  # pylint: disable=broad-except
+        log(f"MS Office-konvertering fejlede ({ext}): {exc}")
+        ok = False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    if ok and out_path.exists() and out_path.stat().st_size > 0:
+        return out_path
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
 
@@ -450,6 +614,7 @@ def convert_to_pdf(
     *,
     soffice_path: str | None = None,
     auto_install: bool = False,
+    prefer_msoffice: bool = True,
     log=None,
 ) -> tuple[Path | None, str, str]:
     """Convert ``src`` to PDF, choosing the method from ``ext``.
@@ -459,15 +624,19 @@ def convert_to_pdf(
       * ``"skipped"`` — deliberately not converted (video/audio/unknown)
       * ``"error"``   — conversion was attempted but failed
 
-    For already-PDF input the original path is returned unchanged with status
-    ``"ready"``.
+    Office documents are converted with the locally-installed Microsoft Office
+    (Word/Excel/PowerPoint) when available — higher fidelity than LibreOffice —
+    and fall back to LibreOffice otherwise. Set ``prefer_msoffice=False`` to
+    force LibreOffice.
 
-    When ``auto_install`` is True, the LibreOffice-backed paths
-    (office/email/unknown) ensure LibreOffice is installed first via
-    ``ensure_libreoffice`` — installing it if the worker doesn't have it yet.
+    When ``auto_install`` is True the LibreOffice fallback installs LibreOffice
+    on the worker if it's missing (via ``ensure_libreoffice``). MS Office is
+    never installed automatically — it's expected to be present or not.
     """
+    log = log or (lambda *_: None)
     src = Path(src)
     out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     kind = classify(ext)
 
     if kind == "pdf":
@@ -480,20 +649,31 @@ def convert_to_pdf(
             return result, "ready", ""
         return None, "error", f"Billedet kunne ikke konverteres ({ext})."
 
-    # The remaining kinds (office/email/unknown) need LibreOffice.
     if kind == "skip":
         return None, "skipped", f"Filtypen {ext} kan ikke konverteres til PDF (gennemse manuelt)."
 
+    # ----- office: MS Office first (best fidelity), LibreOffice fallback -----
+    if kind == "office":
+        if prefer_msoffice and msoffice_available(ext):
+            out = out_dir / f"{src.stem}.pdf"
+            result = msoffice_to_pdf(src, out, log=log)
+            if result:
+                return result, "ready", ""
+            log("MS Office utilgængelig/fejlede — falder tilbage til LibreOffice")
+        try:
+            soffice_path = ensure_libreoffice(soffice_path, install=auto_install, log=log)
+        except RuntimeError as exc:
+            return None, "error", str(exc)
+        result = office_to_pdf(src, out_dir, soffice_path=soffice_path)
+        if result:
+            return result, "ready", ""
+        return None, "error", f"Kunne ikke konvertere filen ({ext})."
+
+    # ----- email / unknown: LibreOffice (Office can't open these well) -------
     try:
         soffice_path = ensure_libreoffice(soffice_path, install=auto_install, log=log)
     except RuntimeError as exc:
         return None, "error", str(exc)
-
-    if kind == "office":
-        result = office_to_pdf(src, out_dir, soffice_path=soffice_path)
-        if result:
-            return result, "ready", ""
-        return None, "error", f"LibreOffice kunne ikke konvertere filen ({ext})."
 
     if kind == "email":
         result = email_to_pdf(src, ext, out_dir, soffice_path=soffice_path)
@@ -501,7 +681,7 @@ def convert_to_pdf(
             return result, "ready", ""
         return None, "error", f"E-mailen kunne ikke konverteres ({ext})."
 
-    # unknown — try LibreOffice as a last resort; it handles many odd formats.
+    # unknown — LibreOffice as a last resort; it handles many odd formats.
     result = office_to_pdf(src, out_dir, soffice_path=soffice_path)
     if result:
         return result, "ready", ""

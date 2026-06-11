@@ -32,6 +32,10 @@ dependencies = [
 pdf = [
     "Pillow >= 10.0",
     "extract-msg >= 0.48",
+    # Drives the locally-installed Microsoft Office (Word/Excel/PowerPoint) via
+    # COM for high-fidelity PDF export; Windows only. Falls back to LibreOffice
+    # when Office or pywin32 is absent.
+    "pywin32 >= 306; sys_platform == 'win32'",
 ]
 dev = [
     "pylint",
