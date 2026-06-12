@@ -9,9 +9,14 @@ processes):
 * .msg / .eml            → parsed to HTML, then LibreOffice
 * video / audio / unknown→ skipped (caller marks "kan ikke konverteres")
 
-LibreOffice must be installed on the worker. Point at it with the
-``LIBREOFFICE_PATH`` env var, or pass ``soffice_path`` explicitly. Default
-Windows location: ``C:\\Program Files\\LibreOffice\\program\\soffice.exe``.
+LibreOffice must be reachable on the worker. ``ensure_libreoffice`` will, if it
+is missing, auto-install it — and on Windows it does so **without admin** by
+running an MSI administrative install (``msiexec /a``), which just unpacks the
+files (no UAC prompt). Override the source MSI with ``LIBREOFFICE_MSI_URL`` and
+the extract location with ``OOMTM_LIBREOFFICE_DIR``. To skip auto-install
+entirely, point at an existing binary with ``LIBREOFFICE_PATH`` or pass
+``soffice_path``. Default Windows location:
+``C:\\Program Files\\LibreOffice\\program\\soffice.exe``.
 
 Heavy third-party imports (Pillow, extract_msg) are done lazily so that
 processes which only need office conversion don't pay for them, and so a
@@ -26,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -114,6 +120,10 @@ def find_soffice(soffice_path: str | None = None) -> str:
         found = shutil.which(name)
         if found:
             candidates.append(found)
+    # A previous no-admin extract (msiexec /a) drops soffice.exe here.
+    noadmin = _find_soffice_in(_NOADMIN_DIR)
+    if noadmin:
+        candidates.append(noadmin)
     candidates.extend(_DEFAULT_SOFFICE_PATHS)
     for c in candidates:
         if c and Path(c).exists():
@@ -124,6 +134,70 @@ def find_soffice(soffice_path: str | None = None) -> str:
 
 
 _INSTALL_LOCK = Path(tempfile.gettempdir()) / "oomtm_libreoffice_install.lock"
+
+# Pinned stable build for the no-admin extract. Override with LIBREOFFICE_MSI_URL
+# (e.g. an internal mirror) if this version is retired or the worker has no
+# direct internet access.
+_DEFAULT_LO_MSI_URL = (
+    "https://download.documentfoundation.org/libreoffice/stable/"
+    "26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
+)
+
+# Where a no-admin extract lands. LOCALAPPDATA is user-writable (no admin), and
+# its path normally has no spaces (msiexec mangles spaced TARGETDIR values).
+# Override with OOMTM_LIBREOFFICE_DIR if needed.
+_NOADMIN_DIR = Path(
+    os.getenv("OOMTM_LIBREOFFICE_DIR")
+    or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "libreoffice")
+)
+
+
+def _find_soffice_in(dir_: Path) -> str | None:
+    """Return the first ``soffice.exe`` found under *dir_*, or None."""
+    try:
+        for p in Path(dir_).rglob("soffice.exe"):
+            return str(p)
+    except OSError:
+        pass
+    return None
+
+
+def _download(url: str, dest: Path, log, timeout: int) -> None:
+    log(f"LibreOffice: henter MSI fra {url} …")
+    with urllib.request.urlopen(url, timeout=timeout) as resp, open(dest, "wb") as fh:
+        shutil.copyfileobj(resp, fh, length=1 << 20)
+
+
+def _extract_libreoffice_no_admin(log, timeout: int) -> None:
+    """Unpack LibreOffice without admin rights via an MSI administrative install.
+
+    ``msiexec /a`` only *copies* the program files to TARGETDIR — it neither
+    installs nor registers anything, so it raises no UAC prompt. The resulting
+    ``soffice.exe`` works fine for headless conversion. Override the source MSI
+    with the ``LIBREOFFICE_MSI_URL`` env var.
+    """
+    if " " in str(_NOADMIN_DIR):
+        # msiexec misparses a TARGETDIR containing spaces. Let the caller fall
+        # through to winget/choco (or the manual LIBREOFFICE_PATH route).
+        raise RuntimeError(
+            f"sti indeholder mellemrum ({_NOADMIN_DIR}); sæt OOMTM_LIBREOFFICE_DIR"
+        )
+    url = os.getenv("LIBREOFFICE_MSI_URL", _DEFAULT_LO_MSI_URL)
+    _NOADMIN_DIR.mkdir(parents=True, exist_ok=True)
+    msi = _NOADMIN_DIR / "libreoffice.msi"
+    _download(url, msi, log, timeout=min(timeout, 1200))
+    log("LibreOffice: udpakker (msiexec /a — ingen admin)…")
+    subprocess.run(
+        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={_NOADMIN_DIR}"],
+        check=True, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        msi.unlink()
+    except OSError:
+        pass
+    if not _find_soffice_in(_NOADMIN_DIR):
+        raise RuntimeError("LibreOffice udpakket, men soffice.exe blev ikke fundet.")
 
 
 def _run_installer(cmd: list[str], log, timeout: int) -> None:
@@ -142,6 +216,14 @@ def _install_libreoffice(log, timeout: int) -> None:
     as the document's file_note so an admin knows to install it manually).
     """
     if sys.platform.startswith("win"):
+        # No-admin first: msiexec /a unpacks the files with no UAC prompt. Robot
+        # accounts usually can't elevate, so this is the primary path; winget and
+        # Chocolatey (which need admin) are only tried if the extract fails.
+        try:
+            _extract_libreoffice_no_admin(log, timeout)
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            log(f"LibreOffice: no-admin udpakning mislykkedes ({exc}); prøver winget/choco.")
         winget = shutil.which("winget")
         if winget:
             _run_installer(
@@ -155,8 +237,9 @@ def _install_libreoffice(log, timeout: int) -> None:
             _run_installer([choco, "install", "libreoffice-fresh", "-y", "--no-progress"], log, timeout)
             return
         raise RuntimeError(
-            "Kan ikke auto-installere LibreOffice: hverken winget eller Chocolatey "
-            "findes på maskinen. Installér LibreOffice manuelt, eller sæt LIBREOFFICE_PATH."
+            "Kan ikke auto-installere LibreOffice (no-admin udpakning fejlede, og "
+            "hverken winget eller Chocolatey findes). Sæt LIBREOFFICE_MSI_URL til et "
+            "tilgængeligt MSI, eller udpak manuelt og sæt LIBREOFFICE_PATH."
         )
     # POSIX
     for mgr, args in (("apt-get", ["-y", "install", "libreoffice"]),
@@ -614,7 +697,7 @@ def convert_to_pdf(
     *,
     soffice_path: str | None = None,
     auto_install: bool = False,
-    prefer_msoffice: bool = True,
+    prefer_msoffice: bool | None = None,
     log=None,
 ) -> tuple[Path | None, str, str]:
     """Convert ``src`` to PDF, choosing the method from ``ext``.
@@ -624,16 +707,22 @@ def convert_to_pdf(
       * ``"skipped"`` — deliberately not converted (video/audio/unknown)
       * ``"error"``   — conversion was attempted but failed
 
-    Office documents are converted with the locally-installed Microsoft Office
-    (Word/Excel/PowerPoint) when available — higher fidelity than LibreOffice —
-    and fall back to LibreOffice otherwise. Set ``prefer_msoffice=False`` to
-    force LibreOffice.
+    Office documents are converted with **LibreOffice headless by default** —
+    it's concurrency-safe (each call gets its own profile) and reliable
+    unattended. MS Office (COM automation) gives higher fidelity for Word/
+    PowerPoint but is single-desktop and unsafe to run concurrently, so it is
+    opt-in: pass ``prefer_msoffice=True`` or set ``OOMTM_PREFER_MSOFFICE=1``.
+    The default (``None``) reads that env var and stays off unless it's set.
 
-    When ``auto_install`` is True the LibreOffice fallback installs LibreOffice
-    on the worker if it's missing (via ``ensure_libreoffice``). MS Office is
-    never installed automatically — it's expected to be present or not.
+    When ``auto_install`` is True the LibreOffice path installs LibreOffice on
+    the worker if it's missing (via ``ensure_libreoffice`` — no-admin on
+    Windows). MS Office is never installed automatically.
     """
     log = log or (lambda *_: None)
+    if prefer_msoffice is None:
+        prefer_msoffice = os.getenv("OOMTM_PREFER_MSOFFICE", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
     src = Path(src)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
