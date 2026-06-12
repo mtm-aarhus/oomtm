@@ -162,10 +162,35 @@ def _find_soffice_in(dir_: Path) -> str | None:
     return None
 
 
+# MSI files are OLE compound documents starting with this signature. A mirror
+# "choose a download" page or an error page (served HTTP 200) would otherwise be
+# saved as a .msi and make msiexec fail with a cryptic code.
+_MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
 def _download(url: str, dest: Path, log, timeout: int) -> None:
     log(f"LibreOffice: henter MSI fra {url} …")
-    with urllib.request.urlopen(url, timeout=timeout) as resp, open(dest, "wb") as fh:
+    req = urllib.request.Request(url, headers={"User-Agent": "oomtm-libreoffice-setup"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
         shutil.copyfileobj(resp, fh, length=1 << 20)
+
+
+def _tail_text(path: Path, max_chars: int = 2000) -> str:
+    """Best-effort tail of an MSI log (Windows writes these as UTF-16 LE)."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    if data[:2] == b"\xff\xfe":
+        text = data.decode("utf-16-le", errors="replace")
+    elif data[:3] == b"\xef\xbb\xbf":
+        text = data.decode("utf-8-sig", errors="replace")
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1", errors="replace")
+    return text.strip()[-max_chars:]
 
 
 def _extract_libreoffice_no_admin(log, timeout: int) -> None:
@@ -183,21 +208,46 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
             f"sti indeholder mellemrum ({_NOADMIN_DIR}); sæt OOMTM_LIBREOFFICE_DIR"
         )
     url = os.getenv("LIBREOFFICE_MSI_URL", _DEFAULT_LO_MSI_URL)
-    _NOADMIN_DIR.mkdir(parents=True, exist_ok=True)
-    msi = _NOADMIN_DIR / "libreoffice.msi"
+    target = _NOADMIN_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    # The source MSI must live OUTSIDE the extraction target: msiexec /a fails
+    # with 1603 when TARGETDIR is the folder that holds the source package. Also
+    # clear a stray MSI left inside the target by an earlier failed run.
+    (target / "libreoffice.msi").unlink(missing_ok=True)
+    msi = target.parent / "libreoffice-download.msi"
+    log_path = target.parent / "libreoffice-msi-install.log"
     _download(url, msi, log, timeout=min(timeout, 1200))
-    log("LibreOffice: udpakker (msiexec /a — ingen admin)…")
-    subprocess.run(
-        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={_NOADMIN_DIR}"],
-        check=True, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+
+    head = b""
     try:
-        msi.unlink()
+        with open(msi, "rb") as fh:
+            head = fh.read(8)
     except OSError:
         pass
-    if not _find_soffice_in(_NOADMIN_DIR):
-        raise RuntimeError("LibreOffice udpakket, men soffice.exe blev ikke fundet.")
+    if head != _MSI_MAGIC:
+        size = msi.stat().st_size if msi.exists() else 0
+        msi.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"hentet fil er ikke en gyldig MSI (størrelse {size} bytes). "
+            f"Tjek LIBREOFFICE_MSI_URL: {url}"
+        )
+
+    log("LibreOffice: udpakker (msiexec /a — ingen admin)…")
+    proc = subprocess.run(
+        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={target}", "/l*v", str(log_path)],
+        timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        tail = _tail_text(log_path)
+        raise RuntimeError(
+            f"msiexec /a fejlede (kode {proc.returncode}). Fuld log: {log_path}"
+            + (f"\n--- log-hale ---\n{tail}" if tail else "")
+        )
+    msi.unlink(missing_ok=True)
+    if not _find_soffice_in(target):
+        raise RuntimeError(
+            f"LibreOffice udpakket til {target}, men soffice.exe blev ikke fundet."
+        )
 
 
 def _run_installer(cmd: list[str], log, timeout: int) -> None:
