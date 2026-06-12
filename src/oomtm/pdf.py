@@ -288,11 +288,11 @@ def office_to_pdf(
 # ---------------------------------------------------------------------------
 
 _MSOFFICE_APP = {}
-for _e in ("doc", "docx", "docm", "dot", "dotx", "rtf", "odt", "txt", "htm", "html"):
+for _e in ("doc", "docx", "docm", "dot", "dotx"):
     _MSOFFICE_APP[_e] = "word"
-for _e in ("xls", "xlsx", "xlsm", "xlsb", "xltx", "csv", "ods"):
-    _MSOFFICE_APP[_e] = "excel"
-for _e in ("ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp"):
+# for _e in ("xls", "xlsx", "xlsm", "xlsb", "xltx"):
+#     _MSOFFICE_APP[_e] = "excel"
+for _e in ("ppt", "pptx", "pps", "ppsx", "pot", "potx"):
     _MSOFFICE_APP[_e] = "powerpoint"
 
 _MSO_SECURITY_FORCE_DISABLE = 3  # msoAutomationSecurityForceDisable
