@@ -168,11 +168,23 @@ def _find_soffice_in(dir_: Path) -> str | None:
 _MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
-def _download(url: str, dest: Path, log, timeout: int) -> None:
+def _download(url: str, dest: Path, log, timeout: int, attempts: int = 3) -> None:
     log(f"LibreOffice: henter MSI fra {url} …")
     req = urllib.request.Request(url, headers={"User-Agent": "oomtm-libreoffice-setup"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
-        shutil.copyfileobj(resp, fh, length=1 << 20)
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
+                shutil.copyfileobj(resp, fh, length=1 << 20)
+            return
+        except OSError as exc:
+            # URLError / SSLError / timeout. Downloads from CDNs intermittently
+            # fail TLS verification ("unable to get local issuer certificate")
+            # when a node serves an incomplete chain; another node on retry
+            # usually succeeds. Retry a few times before giving up.
+            if attempt == attempts:
+                raise
+            log(f"LibreOffice: download forsøg {attempt}/{attempts} fejlede ({exc}); prøver igen…")
+            time.sleep(2 * attempt)
 
 
 def _tail_text(path: Path, max_chars: int = 2000) -> str:
