@@ -158,6 +158,7 @@ def find_soffice(soffice_path: str | None = None) -> str:
 
 
 _INSTALL_LOCK = Path(tempfile.gettempdir()) / "oomtm_libreoffice_install.lock"
+_MSIEXEC_LOCK = Path(tempfile.gettempdir()) / "oomtm_msiexec.lock"
 
 # Pinned stable build for the no-admin extract. Override with LIBREOFFICE_MSI_URL
 # (e.g. an internal mirror) if this version is retired or the worker has no
@@ -189,6 +190,7 @@ def _find_soffice_in(dir_: Path) -> str | None:
 # "choose a download" page or an error page (served HTTP 200) would otherwise be
 # saved as a .msi and make msiexec fail with a cryptic code.
 _MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_MSI_BUSY_CODE = 1618
 
 
 _SSL_CTX = None
@@ -270,6 +272,82 @@ def _proc_output_tail(proc: subprocess.CompletedProcess, max_chars: int = 2000) 
     return data.decode("utf-8", errors="replace").strip()[-max_chars:]
 
 
+def _run_msiexec_admin_extract(
+    msi: Path,
+    target: Path,
+    log_path: Path,
+    log,
+    timeout: int,
+    label: str,
+) -> None:
+    """Run ``msiexec /a`` with a cross-process oomtm lock and 1618 retries."""
+    deadline = time.monotonic() + timeout
+    lock_logged = False
+
+    while True:
+        try:
+            fd = os.open(str(_MSIEXEC_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - _MSIEXEC_LOCK.stat().st_mtime > timeout:
+                    _MSIEXEC_LOCK.unlink(missing_ok=True)
+            except OSError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{label}: ventede for længe på oomtm MSI-lås.")
+            if not lock_logged:
+                log(f"{label}: venter på anden oomtm MSI-udpakning...")
+                lock_logged = True
+            time.sleep(min(5, max(1, remaining)))
+
+    try:
+        attempt = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{label}: MSI-udpakning timede ud.")
+            attempt += 1
+            proc = subprocess.run(
+                [
+                    "msiexec", "/a", str(msi), "/qn",
+                    f"TARGETDIR={target}", "/l*v", str(log_path),
+                ],
+                timeout=max(1, int(remaining)),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if proc.returncode == 0:
+                return
+
+            tail = _tail_text(log_path)
+            if proc.returncode == _MSI_BUSY_CODE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"{label}: Windows Installer forblev optaget (kode {_MSI_BUSY_CODE}). "
+                        f"Fuld log: {log_path}"
+                        + (f"\n--- log-hale ---\n{tail}" if tail else "")
+                    )
+                wait = min(60, max(5, 5 * attempt), remaining)
+                log(
+                    f"{label}: Windows Installer er optaget (kode {_MSI_BUSY_CODE}); "
+                    f"prøver igen om {int(wait)} sek."
+                )
+                time.sleep(wait)
+                continue
+
+            raise RuntimeError(
+                f"{label}: MSI-udpakning fejlede (kode {proc.returncode}). Fuld log: {log_path}"
+                + (f"\n--- log-hale ---\n{tail}" if tail else "")
+            )
+    finally:
+        _MSIEXEC_LOCK.unlink(missing_ok=True)
+
+
 def _extract_libreoffice_no_admin(log, timeout: int) -> None:
     """Unpack LibreOffice without admin rights via an MSI administrative install.
 
@@ -304,16 +382,7 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
         )
 
     log("LibreOffice: udpakker (msiexec /a — ingen admin)…")
-    proc = subprocess.run(
-        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={target}", "/l*v", str(log_path)],
-        timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        tail = _tail_text(log_path)
-        raise RuntimeError(
-            f"msiexec /a fejlede (kode {proc.returncode}). Fuld log: {log_path}"
-            + (f"\n--- log-hale ---\n{tail}" if tail else "")
-        )
+    _run_msiexec_admin_extract(msi, target, log_path, log, timeout, "LibreOffice")
     msi.unlink(missing_ok=True)
     if not _find_soffice_in(target):
         raise RuntimeError(
@@ -560,16 +629,7 @@ def _ensure_7zip(log, timeout: int) -> Path:
     _verify_archive_magic(msi, _MSI_MAGIC, "MSI", url)
 
     log("7-Zip: udpakker MSI (msiexec /a — ingen admin)...")
-    proc = subprocess.run(
-        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={target}", "/l*v", str(log_path)],
-        timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        tail = _tail_text(log_path)
-        raise RuntimeError(
-            f"7-Zip MSI-udpakning fejlede (kode {proc.returncode}). Fuld log: {log_path}"
-            + (f"\n--- log-hale ---\n{tail}" if tail else "")
-        )
+    _run_msiexec_admin_extract(msi, target, log_path, log, timeout, "7-Zip")
     msi.unlink(missing_ok=True)
 
     found = next(target.rglob("7z.exe"), None)
