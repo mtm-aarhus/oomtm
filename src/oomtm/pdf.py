@@ -449,8 +449,7 @@ _TOOLS_DIR = Path(
 # UB Mannheim publishes the Windows builds referenced by the official Tesseract
 # docs. Override with OOMTM_TESSERACT_EXE_URL for an internal mirror.
 _DEFAULT_TESSERACT_EXE_URL = (
-    "https://digi.bib.uni-mannheim.de/tesseract/"
-    "tesseract-ocr-w64-setup-5.5.0.20241111.exe"
+    "https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe"
 )
 _DEFAULT_7ZR_URL = (
     "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe"
