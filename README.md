@@ -9,7 +9,7 @@ Centralises the gnarly integration code we used to copy-paste across robots:
 | `oomtm.sharepoint` | SharePoint Online cert auth, folder create/delete, chunked upload/download, share-link generation, plus filename sanitization and path-length truncation tailored to SharePoint Online's 400-char URL limit. |
 | `oomtm.go` | GO API: NTLM session, document metadata, chunked download with the `ows_EncodedAbsUrl` fallback for files >10 MB, server-side PDF conversion. |
 | `oomtm.nova` | KMD Nova: DigiCert-intermediate-aware TLS wrapper (`nova_request`), bearer-token refresh with 90-min cache helper, document list + sub-document expansion, file download. |
-| `oomtm.pdf` | PDF conversion. Office docs (Word/Excel/PowerPoint) use the locally-installed **Microsoft Office** via COM for best fidelity, falling back to **LibreOffice** headless; images via Pillow; `.msg`/`.eml`→HTML→PDF. Macros are force-disabled when opening external docs. `ensure_libreoffice()` and `ensure_tesseract()` can bootstrap LibreOffice/Tesseract on the worker. On Windows this is no-admin: LibreOffice is unpacked from MSI and Tesseract is extracted from the UB Mannheim installer into the user's AppData, with the binary folder added to the current process PATH. Install with the `[pdf]` extra. |
+| `oomtm.pdf` | PDF conversion. Office docs (Word/Excel/PowerPoint) use the locally-installed **Microsoft Office** via COM for best fidelity, falling back to **LibreOffice** headless; images via Pillow; `.msg`/`.eml`→HTML→PDF. Macros are force-disabled when opening external docs. `ensure_libreoffice()` and `ensure_tesseract()` can bootstrap LibreOffice/Tesseract on the worker. On Windows this is no-admin: LibreOffice is unpacked from MSI and Tesseract is extracted from the Windows installer into the user's AppData, with the binary folder added to the current process PATH. Install with the `[pdf]` extra. |
 
 ## Design
 
@@ -40,7 +40,7 @@ Windows robot users do not need admin rights for the LibreOffice/Tesseract boots
 
 - `LIBREOFFICE_MSI_URL`, `OOMTM_LIBREOFFICE_DIR`
 - `OOMTM_TESSERACT_EXE_URL`, `OOMTM_TESSERACT_DIR`
-- `OOMTM_7ZR_URL`, `OOMTM_7ZIP_EXTRA_URL`, `OOMTM_TOOLS_DIR`
+- `OOMTM_7ZIP_MSI_URL`, `OOMTM_TOOLS_DIR`
 - `OOMTM_TESSDATA_DIR`, `OOMTM_TESSDATA_BASE_URL`
 
 Existing installs still win when `LIBREOFFICE_PATH` or `TESSERACT_PATH` points at a binary.

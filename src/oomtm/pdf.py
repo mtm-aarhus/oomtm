@@ -446,18 +446,15 @@ _TOOLS_DIR = Path(
     os.getenv("OOMTM_TOOLS_DIR")
     or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "tools")
 )
-# UB Mannheim publishes the Windows builds referenced by the official Tesseract
-# docs. Override with OOMTM_TESSERACT_EXE_URL for an internal mirror.
+# Windows Tesseract installer source. Override with OOMTM_TESSERACT_EXE_URL for
+# an internal mirror.
 _DEFAULT_TESSERACT_EXE_URL = (
-    "https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe"
+    "https://github.com/tesseract-ocr/tesseract/releases/download/"
+    "5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe"
 )
-_DEFAULT_7ZR_URL = (
-    "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe"
+_DEFAULT_7ZIP_MSI_URL = (
+    "https://github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.msi"
 )
-_DEFAULT_7ZIP_EXTRA_URL = (
-    "https://github.com/ip7z/7zip/releases/download/26.01/7z2601-extra.7z"
-)
-_SEVENZ_MAGIC = b"7z\xbc\xaf\x27\x1c"
 # User-writable folder for the language data, so adding a language (e.g. Danish)
 # never needs admin rights on the binary's own (Program Files) tessdata folder.
 _TESSDATA_DIR = Path(
@@ -539,7 +536,7 @@ def _run_7zip(sevenzip: Path, archive: Path, target: Path, log, timeout: int) ->
 
 
 def _ensure_7zip(log, timeout: int) -> Path:
-    """Return a no-admin 7z.exe suitable for extracting NSIS installers."""
+    """Return a full 7z.exe suitable for extracting NSIS installers."""
     candidates = [
         shutil.which("7z"),
         r"C:\Program Files\7-Zip\7z.exe",
@@ -551,25 +548,29 @@ def _ensure_7zip(log, timeout: int) -> Path:
             return p
 
     target = _TOOLS_DIR / "7zip"
-    sevenzip = target / "7z.exe"
-    if sevenzip.exists():
-        return sevenzip
+    existing = next(target.rglob("7z.exe"), None) if target.exists() else None
+    if existing:
+        return existing
 
     target.mkdir(parents=True, exist_ok=True)
-    sevenzr = target / "7zr.exe"
-    if not sevenzr.exists() or not _looks_like_windows_exe(sevenzr):
-        url = os.getenv("OOMTM_7ZR_URL", _DEFAULT_7ZR_URL)
-        _download(url, sevenzr, log, timeout=min(timeout, 600))
-        if not _looks_like_windows_exe(sevenzr):
-            sevenzr.unlink(missing_ok=True)
-            raise RuntimeError(f"hentet 7zr.exe ser ugyldig ud. Tjek OOMTM_7ZR_URL: {url}")
+    msi = target.parent / "7zip-download.msi"
+    log_path = target.parent / "7zip-msi-install.log"
+    url = os.getenv("OOMTM_7ZIP_MSI_URL", _DEFAULT_7ZIP_MSI_URL)
+    _download(url, msi, log, timeout=min(timeout, 600))
+    _verify_archive_magic(msi, _MSI_MAGIC, "MSI", url)
 
-    extra = target / "7zip-extra.7z"
-    url = os.getenv("OOMTM_7ZIP_EXTRA_URL", _DEFAULT_7ZIP_EXTRA_URL)
-    _download(url, extra, log, timeout=min(timeout, 600))
-    _verify_archive_magic(extra, _SEVENZ_MAGIC, "7z-arkiv", url)
-    _run_7zip(sevenzr, extra, target, log, timeout=min(timeout, 600))
-    extra.unlink(missing_ok=True)
+    log("7-Zip: udpakker MSI (msiexec /a — ingen admin)...")
+    proc = subprocess.run(
+        ["msiexec", "/a", str(msi), "/qn", f"TARGETDIR={target}", "/l*v", str(log_path)],
+        timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        tail = _tail_text(log_path)
+        raise RuntimeError(
+            f"7-Zip MSI-udpakning fejlede (kode {proc.returncode}). Fuld log: {log_path}"
+            + (f"\n--- log-hale ---\n{tail}" if tail else "")
+        )
+    msi.unlink(missing_ok=True)
 
     found = next(target.rglob("7z.exe"), None)
     if not found:
@@ -580,8 +581,8 @@ def _ensure_7zip(log, timeout: int) -> Path:
 def _extract_tesseract_no_admin(log, timeout: int) -> None:
     """Unpack Tesseract into a user-writable folder without running its installer.
 
-    The UB Mannheim installer is NSIS-based and writes machine registry keys
-    when executed. Extracting it with 7-Zip gives us the runnable files without
+    The Windows installer is NSIS-based and writes machine registry keys when
+    executed. Extracting it with 7-Zip gives us the runnable files without
     touching HKLM, services, Start Menu entries, or machine PATH.
     """
     url = os.getenv("OOMTM_TESSERACT_EXE_URL", _DEFAULT_TESSERACT_EXE_URL)
