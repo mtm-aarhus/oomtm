@@ -13,10 +13,13 @@ LibreOffice must be reachable on the worker. ``ensure_libreoffice`` will, if it
 is missing, auto-install it — and on Windows it does so **without admin** by
 running an MSI administrative install (``msiexec /a``), which just unpacks the
 files (no UAC prompt). Override the source MSI with ``LIBREOFFICE_MSI_URL`` and
-the extract location with ``OOMTM_LIBREOFFICE_DIR``. To skip auto-install
-entirely, point at an existing binary with ``LIBREOFFICE_PATH`` or pass
-``soffice_path``. Default Windows location:
-``C:\\Program Files\\LibreOffice\\program\\soffice.exe``.
+the extract location with ``OOMTM_LIBREOFFICE_DIR``. Tesseract uses the same
+no-admin idea on Windows: the installer is downloaded and extracted with a
+per-user 7-Zip helper, then the extracted binary directory is prepended to this
+process' ``PATH``. Override with ``OOMTM_TESSERACT_EXE_URL`` /
+``OOMTM_TESSERACT_DIR``. To skip auto-install entirely, point at existing
+binaries with ``LIBREOFFICE_PATH`` / ``TESSERACT_PATH`` or pass the explicit
+path argument.
 
 Heavy third-party imports (Pillow, extract_msg) are done lazily so that
 processes which only need office conversion don't pay for them, and so a
@@ -27,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -94,6 +98,24 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> bytes:
     return h.digest()
 
 
+def _prepend_process_path(dir_: str | Path) -> None:
+    """Make a no-admin tool install visible to child processes in this run."""
+    value = str(Path(dir_))
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if any(os.path.normcase(p) == os.path.normcase(value) for p in parts):
+        return
+    os.environ["PATH"] = value + (os.pathsep + current if current else "")
+
+
+def _looks_like_windows_exe(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # LibreOffice
 # ---------------------------------------------------------------------------
@@ -126,8 +148,10 @@ def find_soffice(soffice_path: str | None = None) -> str:
         candidates.append(noadmin)
     candidates.extend(_DEFAULT_SOFFICE_PATHS)
     for c in candidates:
-        if c and Path(c).exists():
-            return c
+        p = Path(c) if c else None
+        if p and p.exists():
+            _prepend_process_path(p.parent)
+            return str(p)
     raise RuntimeError(
         "LibreOffice (soffice) not found. Install it or set LIBREOFFICE_PATH."
     )
@@ -143,8 +167,7 @@ _DEFAULT_LO_MSI_URL = (
     "26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
 )
 
-# Where a no-admin extract lands. LOCALAPPDATA is user-writable (no admin), and
-# its path normally has no spaces (msiexec mangles spaced TARGETDIR values).
+# Where a no-admin extract lands. LOCALAPPDATA is user-writable (no admin).
 # Override with OOMTM_LIBREOFFICE_DIR if needed.
 _NOADMIN_DIR = Path(
     os.getenv("OOMTM_LIBREOFFICE_DIR")
@@ -168,23 +191,58 @@ def _find_soffice_in(dir_: Path) -> str | None:
 _MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
+_SSL_CTX = None
+
+
+def _ssl_context(log):
+    """An SSL context that trusts the OS certificate store, like Edge does.
+
+    Behind a corporate TLS-inspection proxy, the server presents a certificate
+    signed by an internal CA that lives in the Windows trust store but NOT in
+    Python's bundled CA list, so the default urllib verification fails with
+    "unable to get local issuer certificate". ``truststore`` routes verification
+    through the OS verifier (Windows SChannel), which trusts that CA and chases
+    missing intermediates — exactly like Windows-native tools that already work
+    here.
+    """
+    global _SSL_CTX
+    if _SSL_CTX is not None:
+        return _SSL_CTX
+    try:
+        import truststore
+        _SSL_CTX = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception as exc:  # pylint: disable=broad-except
+        log(f"truststore utilgængelig ({exc}); bruger Pythons standard-certifikater.")
+        _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
+
 def _download(url: str, dest: Path, log, timeout: int, attempts: int = 3) -> None:
-    log(f"LibreOffice: henter MSI fra {url} …")
-    req = urllib.request.Request(url, headers={"User-Agent": "oomtm-libreoffice-setup"})
+    log(f"Henter {url} …")
+    req = urllib.request.Request(url, headers={"User-Agent": "oomtm-setup"})
+    ctx = _ssl_context(log)
+    last_exc = None
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, open(dest, "wb") as fh:
                 shutil.copyfileobj(resp, fh, length=1 << 20)
             return
-        except OSError as exc:
-            # URLError / SSLError / timeout. Downloads from CDNs intermittently
-            # fail TLS verification ("unable to get local issuer certificate")
-            # when a node serves an incomplete chain; another node on retry
-            # usually succeeds. Retry a few times before giving up.
-            if attempt == attempts:
-                raise
-            log(f"LibreOffice: download forsøg {attempt}/{attempts} fejlede ({exc}); prøver igen…")
-            time.sleep(2 * attempt)
+        except OSError as exc:  # URLError / SSLError / timeout
+            last_exc = exc
+            if attempt < attempts:
+                log(f"Download forsøg {attempt}/{attempts} fejlede ({exc}); prøver igen…")
+                time.sleep(2 * attempt)
+    # Last resort (opt-in): some locked-down networks break TLS verification in a
+    # way truststore can't fix. OOMTM_DOWNLOAD_INSECURE=1 fetches without
+    # verifying the cert — only safe because the file is integrity-checked after
+    # download (MSI magic bytes / sha256) and the network is the kommune's own.
+    if str(os.getenv("OOMTM_DOWNLOAD_INSECURE", "")).strip().lower() in ("1", "true", "yes", "on"):
+        log("ADVARSEL: henter UDEN certifikatvalidering (OOMTM_DOWNLOAD_INSECURE=1).")
+        unverified = ssl._create_unverified_context()  # noqa: S323 - opt-in, integrity-checked
+        with urllib.request.urlopen(req, timeout=timeout, context=unverified) as resp, open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh, length=1 << 20)
+        return
+    raise last_exc
 
 
 def _tail_text(path: Path, max_chars: int = 2000) -> str:
@@ -205,6 +263,13 @@ def _tail_text(path: Path, max_chars: int = 2000) -> str:
     return text.strip()[-max_chars:]
 
 
+def _proc_output_tail(proc: subprocess.CompletedProcess, max_chars: int = 2000) -> str:
+    data = (proc.stdout or b"") + b"\n" + (proc.stderr or b"")
+    if not data.strip():
+        return ""
+    return data.decode("utf-8", errors="replace").strip()[-max_chars:]
+
+
 def _extract_libreoffice_no_admin(log, timeout: int) -> None:
     """Unpack LibreOffice without admin rights via an MSI administrative install.
 
@@ -213,12 +278,6 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
     ``soffice.exe`` works fine for headless conversion. Override the source MSI
     with the ``LIBREOFFICE_MSI_URL`` env var.
     """
-    if " " in str(_NOADMIN_DIR):
-        # msiexec misparses a TARGETDIR containing spaces. Let the caller fall
-        # through to winget/choco (or the manual LIBREOFFICE_PATH route).
-        raise RuntimeError(
-            f"sti indeholder mellemrum ({_NOADMIN_DIR}); sæt OOMTM_LIBREOFFICE_DIR"
-        )
     url = os.getenv("LIBREOFFICE_MSI_URL", _DEFAULT_LO_MSI_URL)
     target = _NOADMIN_DIR
     target.mkdir(parents=True, exist_ok=True)
@@ -263,7 +322,7 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
 
 
 def _run_installer(cmd: list[str], log, timeout: int) -> None:
-    log(f"LibreOffice: running {' '.join(cmd[:3])}…")
+    log(f"Kører {' '.join(cmd[:3])}…")
     subprocess.run(
         cmd, check=True, timeout=timeout,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -271,38 +330,26 @@ def _run_installer(cmd: list[str], log, timeout: int) -> None:
 
 
 def _install_libreoffice(log, timeout: int) -> None:
-    """Install LibreOffice with whatever package manager the machine has.
+    """Install LibreOffice, without admin on Windows.
 
-    Windows: winget → Chocolatey. Linux: apt-get → dnf. Raises with a clear
-    message if no supported installer is available (the caller surfaces that
-    as the document's file_note so an admin knows to install it manually).
+    Windows: unpack the official MSI into a user-writable folder. Linux:
+    apt-get → dnf. Raises with a clear message if no supported installer is
+    available (the caller surfaces that as the document's file_note so an admin
+    knows to install it manually).
     """
     if sys.platform.startswith("win"):
-        # No-admin first: msiexec /a unpacks the files with no UAC prompt. Robot
-        # accounts usually can't elevate, so this is the primary path; winget and
-        # Chocolatey (which need admin) are only tried if the extract fails.
+        # msiexec /a unpacks the files with no UAC prompt. Robot accounts
+        # usually can't elevate, so Windows never falls back to package managers.
         try:
             _extract_libreoffice_no_admin(log, timeout)
             return
         except Exception as exc:  # pylint: disable=broad-except
-            log(f"LibreOffice: no-admin udpakning mislykkedes ({exc}); prøver winget/choco.")
-        winget = shutil.which("winget")
-        if winget:
-            _run_installer(
-                [winget, "install", "--id", "TheDocumentFoundation.LibreOffice", "-e",
-                 "--silent", "--accept-package-agreements", "--accept-source-agreements"],
-                log, timeout,
-            )
-            return
-        choco = shutil.which("choco")
-        if choco:
-            _run_installer([choco, "install", "libreoffice-fresh", "-y", "--no-progress"], log, timeout)
-            return
-        raise RuntimeError(
-            "Kan ikke auto-installere LibreOffice (no-admin udpakning fejlede, og "
-            "hverken winget eller Chocolatey findes). Sæt LIBREOFFICE_MSI_URL til et "
-            "tilgængeligt MSI, eller udpak manuelt og sæt LIBREOFFICE_PATH."
-        )
+            raise RuntimeError(
+                "Kan ikke auto-installere LibreOffice uden admin. "
+                f"No-admin udpakning fejlede: {exc}. "
+                "Sæt LIBREOFFICE_MSI_URL til et tilgængeligt MSI, eller udpak "
+                "manuelt og sæt LIBREOFFICE_PATH."
+            ) from exc
     # POSIX
     for mgr, args in (("apt-get", ["-y", "install", "libreoffice"]),
                       ("dnf", ["-y", "install", "libreoffice"])):
@@ -378,6 +425,304 @@ def ensure_libreoffice(
 
     # Timed out waiting for someone else's install — last try.
     return find_soffice(soffice_path)
+
+
+# ---------------------------------------------------------------------------
+# Tesseract OCR — find or auto-install (binary + language data), like LibreOffice
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TESSERACT_PATHS = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    "/usr/bin/tesseract",
+    "/usr/local/bin/tesseract",
+]
+# Where the no-admin Windows extract lands.
+_TESS_NOADMIN_DIR = Path(
+    os.getenv("OOMTM_TESSERACT_DIR")
+    or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "tesseract")
+)
+_TOOLS_DIR = Path(
+    os.getenv("OOMTM_TOOLS_DIR")
+    or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "tools")
+)
+# UB Mannheim publishes the Windows builds referenced by the official Tesseract
+# docs. Override with OOMTM_TESSERACT_EXE_URL for an internal mirror.
+_DEFAULT_TESSERACT_EXE_URL = (
+    "https://digi.bib.uni-mannheim.de/tesseract/"
+    "tesseract-ocr-w64-setup-5.5.0.20241111.exe"
+)
+_DEFAULT_7ZR_URL = (
+    "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe"
+)
+_DEFAULT_7ZIP_EXTRA_URL = (
+    "https://github.com/ip7z/7zip/releases/download/26.01/7z2601-extra.7z"
+)
+_SEVENZ_MAGIC = b"7z\xbc\xaf\x27\x1c"
+# User-writable folder for the language data, so adding a language (e.g. Danish)
+# never needs admin rights on the binary's own (Program Files) tessdata folder.
+_TESSDATA_DIR = Path(
+    os.getenv("OOMTM_TESSDATA_DIR")
+    or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "tessdata")
+)
+# Small, fast LSTM data — plenty for spotting e-mails/CPR/phone in clean scans.
+# Override the host/quality with OOMTM_TESSDATA_BASE_URL (e.g. .../tessdata_best).
+_TESSDATA_BASE_URL = (
+    os.getenv("OOMTM_TESSDATA_BASE_URL")
+    or "https://github.com/tesseract-ocr/tessdata_fast/raw/main"
+).rstrip("/")
+_TESS_INSTALL_LOCK = Path(tempfile.gettempdir()) / "oomtm_tesseract_install.lock"
+
+
+def _find_tesseract_in(dir_: Path) -> str | None:
+    """Return the first ``tesseract.exe`` found under *dir_*, or None."""
+    try:
+        for p in Path(dir_).rglob("tesseract.exe"):
+            return str(p)
+    except OSError:
+        pass
+    return None
+
+
+def find_tesseract(tesseract_path: str | None = None) -> str:
+    """Locate the Tesseract binary. Order: explicit arg, TESSERACT_PATH env, PATH,
+    no-admin extract, then the usual install locations. Raises if not found."""
+    candidates = []
+    if tesseract_path:
+        candidates.append(tesseract_path)
+    env = os.getenv("TESSERACT_PATH")
+    if env:
+        candidates.append(env)
+    found = shutil.which("tesseract")
+    if found:
+        candidates.append(found)
+    noadmin = _find_tesseract_in(_TESS_NOADMIN_DIR)
+    if noadmin:
+        candidates.append(noadmin)
+    candidates.extend(_DEFAULT_TESSERACT_PATHS)
+    for c in candidates:
+        p = Path(c) if c else None
+        if p and p.exists():
+            _prepend_process_path(p.parent)
+            return str(p)
+    raise RuntimeError("Tesseract not found. Install it or set TESSERACT_PATH.")
+
+
+def _verify_archive_magic(path: Path, magic: bytes, description: str, url: str) -> None:
+    head = b""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(magic))
+    except OSError:
+        pass
+    if head != magic:
+        size = path.stat().st_size if path.exists() else 0
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"hentet fil er ikke en gyldig {description} (størrelse {size} bytes). "
+            f"Tjek URL: {url}"
+        )
+
+
+def _run_7zip(sevenzip: Path, archive: Path, target: Path, log, timeout: int) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(sevenzip), "x", str(archive), f"-o{target}", "-y"],
+        timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        tail = _proc_output_tail(proc)
+        raise RuntimeError(
+            f"7-Zip udpakning fejlede (kode {proc.returncode})."
+            + (f"\n--- output ---\n{tail}" if tail else "")
+        )
+    log(f"Udpakket {archive.name} til {target}.")
+
+
+def _ensure_7zip(log, timeout: int) -> Path:
+    """Return a no-admin 7z.exe suitable for extracting NSIS installers."""
+    candidates = [
+        shutil.which("7z"),
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]
+    for c in candidates:
+        p = Path(c) if c else None
+        if p and p.exists():
+            return p
+
+    target = _TOOLS_DIR / "7zip"
+    sevenzip = target / "7z.exe"
+    if sevenzip.exists():
+        return sevenzip
+
+    target.mkdir(parents=True, exist_ok=True)
+    sevenzr = target / "7zr.exe"
+    if not sevenzr.exists() or not _looks_like_windows_exe(sevenzr):
+        url = os.getenv("OOMTM_7ZR_URL", _DEFAULT_7ZR_URL)
+        _download(url, sevenzr, log, timeout=min(timeout, 600))
+        if not _looks_like_windows_exe(sevenzr):
+            sevenzr.unlink(missing_ok=True)
+            raise RuntimeError(f"hentet 7zr.exe ser ugyldig ud. Tjek OOMTM_7ZR_URL: {url}")
+
+    extra = target / "7zip-extra.7z"
+    url = os.getenv("OOMTM_7ZIP_EXTRA_URL", _DEFAULT_7ZIP_EXTRA_URL)
+    _download(url, extra, log, timeout=min(timeout, 600))
+    _verify_archive_magic(extra, _SEVENZ_MAGIC, "7z-arkiv", url)
+    _run_7zip(sevenzr, extra, target, log, timeout=min(timeout, 600))
+    extra.unlink(missing_ok=True)
+
+    found = next(target.rglob("7z.exe"), None)
+    if not found:
+        raise RuntimeError(f"7-Zip helper udpakket til {target}, men 7z.exe blev ikke fundet.")
+    return found
+
+
+def _extract_tesseract_no_admin(log, timeout: int) -> None:
+    """Unpack Tesseract into a user-writable folder without running its installer.
+
+    The UB Mannheim installer is NSIS-based and writes machine registry keys
+    when executed. Extracting it with 7-Zip gives us the runnable files without
+    touching HKLM, services, Start Menu entries, or machine PATH.
+    """
+    url = os.getenv("OOMTM_TESSERACT_EXE_URL", _DEFAULT_TESSERACT_EXE_URL)
+    target = _TESS_NOADMIN_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    installer = target.parent / "tesseract-download.exe"
+
+    _download(url, installer, log, timeout=min(timeout, 1200))
+    if not _looks_like_windows_exe(installer):
+        size = installer.stat().st_size if installer.exists() else 0
+        installer.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"hentet fil er ikke en gyldig Windows EXE (størrelse {size} bytes). "
+            f"Tjek OOMTM_TESSERACT_EXE_URL: {url}"
+        )
+
+    sevenzip = _ensure_7zip(log, timeout)
+    log("Tesseract: udpakker installer med 7-Zip (ingen admin)...")
+    _run_7zip(sevenzip, installer, target, log, timeout=timeout)
+    installer.unlink(missing_ok=True)
+
+    path = _find_tesseract_in(target)
+    if not path:
+        raise RuntimeError(
+            f"Tesseract udpakket til {target}, men tesseract.exe blev ikke fundet."
+        )
+    _prepend_process_path(Path(path).parent)
+
+
+def _install_tesseract(log, timeout: int) -> None:
+    """Install the Tesseract binary with a no-admin path on Windows."""
+    if sys.platform.startswith("win"):
+        try:
+            _extract_tesseract_no_admin(log, timeout)
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(
+                "Kan ikke auto-installere Tesseract uden admin. "
+                f"No-admin udpakning fejlede: {exc}. "
+                "Sæt OOMTM_TESSERACT_EXE_URL til et tilgængeligt installer-EXE, "
+                "eller udpak manuelt og sæt TESSERACT_PATH."
+            ) from exc
+    for mgr, args in (("apt-get", ["-y", "install", "tesseract-ocr", "tesseract-ocr-dan"]),
+                      ("dnf", ["-y", "install", "tesseract", "tesseract-langpack-dan"])):
+        exe = shutil.which(mgr)
+        if exe:
+            _run_installer([exe, *args], log, timeout)
+            return
+    raise RuntimeError("Kan ikke auto-installere Tesseract: ingen kendt pakkemanager.")
+
+
+def _ensure_tessdata(langs, log, timeout: int) -> Path:
+    """Make sure each language's ``*.traineddata`` is in a user-writable tessdata
+    dir (downloading any that are missing) and return that dir, for use as
+    ``TESSDATA_PREFIX`` — so we never need to write to the binary's own folder."""
+    _TESSDATA_DIR.mkdir(parents=True, exist_ok=True)
+    for lang in langs:
+        dest = _TESSDATA_DIR / f"{lang}.traineddata"
+        if dest.exists() and dest.stat().st_size > 100_000:
+            continue
+        url = f"{_TESSDATA_BASE_URL}/{lang}.traineddata"
+        tmp = dest.with_suffix(".part")
+        _download(url, tmp, log, timeout=min(timeout, 600))
+        # A real traineddata is ≫100 KB; a proxy error page saved as one is tiny.
+        if not tmp.exists() or tmp.stat().st_size < 100_000:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"Hentet {lang}.traineddata ser ugyldig ud. Tjek netværk/URL: {url}")
+        tmp.replace(dest)
+        log(f"Tesseract: sprogdata hentet ({lang}).")
+    return _TESSDATA_DIR
+
+
+def ensure_tesseract(
+    tesseract_path: str | None = None,
+    *,
+    langs=("dan", "eng"),
+    install: bool = True,
+    log=None,
+    install_timeout: int = 1800,
+    wait_timeout: int = 1800,
+) -> str:
+    """Return a usable Tesseract path (installing the binary + the requested
+    language data if missing) and point ``TESSDATA_PREFIX`` at a user-writable
+    folder holding that data. Mirrors :func:`ensure_libreoffice` — lock-guarded
+    so parallel workers don't all install, and a cheap no-op once present.
+
+    Raises ``RuntimeError`` if Tesseract is absent and can't be installed.
+    """
+    log = log or (lambda *_: None)
+
+    def _finish(path):
+        # Point Tesseract at our user tessdata (with dan+eng) for this process.
+        try:
+            os.environ["TESSDATA_PREFIX"] = str(_ensure_tessdata(langs, log, install_timeout))
+        except Exception as exc:  # pylint: disable=broad-except
+            log(f"Tesseract: kunne ikke sikre sprogdata ({exc}).")
+        return path
+
+    try:
+        return _finish(find_tesseract(tesseract_path))
+    except RuntimeError:
+        if not install:
+            raise
+
+    deadline = time.monotonic() + wait_timeout
+    while time.monotonic() < deadline:
+        try:
+            return _finish(find_tesseract(tesseract_path))
+        except RuntimeError:
+            pass
+        try:
+            fd = os.open(str(_TESS_INSTALL_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
+            try:
+                if time.time() - _TESS_INSTALL_LOCK.stat().st_mtime > install_timeout:
+                    _TESS_INSTALL_LOCK.unlink(missing_ok=True)
+            except OSError:
+                pass
+            time.sleep(5)
+            continue
+        try:
+            log("Tesseract ikke fundet — installerer…")
+            try:
+                _install_tesseract(log, install_timeout)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"Tesseract-installation fejlede (exit {exc.returncode}). "
+                    "Installér Tesseract manuelt, eller sæt TESSERACT_PATH."
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Tesseract-installation timede ud.") from exc
+            path = find_tesseract(tesseract_path)
+            log(f"Tesseract installeret: {path}")
+            return _finish(path)
+        finally:
+            _TESS_INSTALL_LOCK.unlink(missing_ok=True)
+
+    return _finish(find_tesseract(tesseract_path))
 
 
 def office_to_pdf(

@@ -24,6 +24,10 @@ dependencies = [
     "certifi >= 2024.2",
     "cryptography >= 42.0",
     "pytz >= 2024.1",
+    # Routes TLS verification through the OS trust store (Windows SChannel), so
+    # downloads work behind a corporate TLS-inspection proxy where Python's
+    # bundled CAs fail. Used by oomtm.pdf's LibreOffice/Tesseract auto-install.
+    "truststore >= 0.9",
 ]
 
 [project.optional-dependencies]
