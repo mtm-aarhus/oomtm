@@ -409,3 +409,81 @@ def get_share_link(
     target = ctx.web.get_folder_by_server_relative_url(path)
     result = target.share_link(kind).execute_query()
     return result.value.sharingLinkInfo.Url
+
+
+# Sharing roles (office365.sharepoint.sharing.role.Role) — re-stated so callers
+# don't need to import the office365 lib. ``role`` is REQUIRED for Flexible links
+# and ignored for the other kinds.
+SHARING_ROLE_VIEW = 1
+SHARING_ROLE_EDIT = 2
+SHARING_ROLE_OWNER = 3
+
+
+def iso_expiration(dt) -> str:
+    """Format a timezone-aware datetime as the ISO-8601 string the share-link
+    expiry expects: ``%Y-%m-%dT%H:%M:%S%z`` (e.g. ``2026-07-22T13:45:00+0000``).
+
+    ``dt`` MUST be timezone-aware (use UTC) — a naive datetime yields an empty
+    offset and SharePoint rejects it. Mirrors the legacy AktBob delivery robot.
+    """
+    return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def create_password_link(
+    ctx: "ClientContext",
+    *,
+    path: str,
+    expiration: str,
+    password: str,
+    role: int = SHARING_ROLE_VIEW,
+) -> str:
+    """Create (or update) a password-protected, expiring **anonymous** sharing
+    link on a folder and return its URL — the citizen-delivery link.
+
+    A recipient who has both the link and the password can view/download until
+    ``expiration``, with no Aarhus login. SharePoint only turns the Flexible link
+    into a password-protected anonymous link when a ``password`` is supplied, so
+    it is required here (no password, no link).
+
+    ``expiration`` is an ISO-8601 string with a UTC offset (see
+    :func:`iso_expiration`). Re-calling this on the same folder updates the one
+    Flexible link in place and returns the same URL: pass the *existing* password
+    to merely push the expiry out, or a *fresh* password to roll it (the old
+    password stops working immediately). ``role`` defaults to view-only.
+
+    This is a verbatim match for the proven AktBob ``get_sharepoint_folder_links``
+    call (link_kind=Flexible, expiration, password, role=View), which the tenant
+    already accepts.
+    """
+    if not password:
+        raise ValueError("create_password_link requires a password (no password, no link).")
+    target = ctx.web.get_folder_by_server_relative_url(path)
+    result = target.share_link(
+        link_kind=SHARING_LINK_FLEXIBLE,
+        expiration=expiration,
+        role=role,
+        password=password,
+    ).execute_query()
+    return result.value.sharingLinkInfo.Url
+
+
+def revoke_share_link(
+    ctx: "ClientContext",
+    *,
+    path: str,
+    kind: int = SHARING_LINK_FLEXIBLE,
+) -> None:
+    """Remove the tokenized sharing link of the given ``kind`` from a folder.
+
+    We create exactly one Flexible link per delivery folder, so removing by kind
+    (with no specific share id) unambiguously revokes it. A folder or link that's
+    already gone counts as success (idempotent), matching :func:`delete_file`.
+    """
+    target = ctx.web.get_folder_by_server_relative_url(path)
+    try:
+        target.unshare_link(kind).execute_query()
+    except Exception as exc:  # pylint: disable=broad-except
+        msg = str(exc).lower()
+        if any(t in msg for t in ("not found", "does not exist", "404", "cannot be found")):
+            return
+        raise
