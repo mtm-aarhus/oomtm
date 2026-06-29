@@ -19,9 +19,12 @@ All functions are stateless; the caller manages the session lifetime.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from urllib.parse import quote
 
 import requests
@@ -239,17 +242,6 @@ def pdf_convert(
 # ---------------------------------------------------------------------------
 
 
-def _extract_case_id(r: requests.Response) -> str:
-    """Pull the new CaseID out of a Create-Case response (tolerates shapes)."""
-    try:
-        data = r.json()
-    except ValueError:
-        return r.text.strip().strip('"')
-    if isinstance(data, dict):
-        return str(data.get("CaseID") or data.get("CaseId") or data.get("Id") or data)
-    return str(data)
-
-
 def create_case(
     s: requests.Session,
     *,
@@ -258,19 +250,30 @@ def create_case(
     case_type_prefix: str = "AKT",
     web: str = "/aktindsigt",
     timeout: int = 120,
-) -> str:
-    """Create a case in GO and return its CaseID (e.g. ``"AKT-2026-000782"``).
+) -> dict:
+    """Create a case in GO and return the parsed response, which includes:
+
+    * ``CaseID``          — e.g. ``"AKT-2026-000782"``
+    * ``CaseRelativeUrl`` — the case's web path, e.g.
+      ``"cases/AKT-2026/AKT-2026-000782"`` — pass it to :func:`set_case_owner`
+      (it's the ``{aktnr}/{aktid}`` ModernConfiguration path).
 
     ``metadata_xml`` is the ``<z:row …/>`` payload with the ows_ attributes for
-    the new case (Title, Sagsprofil, Facet, Modtaget, …). ``web`` is the case
-    web the AKT cases live under (the caller's proven endpoint is
-    ``…/aktindsigt/_goapi/Cases``).
-    """
+    the new case (Title, Sagsprofil, Facet, Modtaget, …). ``web`` is the case web
+    the AKT cases live under (the caller's proven endpoint is
+    ``…/aktindsigt/_goapi/Cases``). On a non-JSON response, only ``CaseID`` is
+    returned (from the raw body)."""
     url = f"{base_url}{web}/_goapi/Cases"
     payload = json.dumps({"CaseTypePrefix": case_type_prefix, "MetadataXml": metadata_xml})
     r = s.post(url, data=payload, timeout=timeout)
     r.raise_for_status()
-    return _extract_case_id(r)
+    try:
+        data = r.json()
+    except ValueError:
+        return {"CaseID": r.text.strip().strip('"'), "CaseRelativeUrl": None}
+    if isinstance(data, dict):
+        return data
+    return {"CaseID": str(data), "CaseRelativeUrl": None}
 
 
 def set_case_metadata(
@@ -315,6 +318,12 @@ def close_case(
 # ---------------------------------------------------------------------------
 
 
+# Above this size, AddToCase's JSON byte-array balloons (~4×) and GO struggles —
+# switch to a chunked SharePoint upload against the case's document library.
+GO_SINGLE_UPLOAD_THRESHOLD = 10 * 1024 * 1024
+GO_CHUNK_SIZE = 1024 * 10240  # 10 MB chunks (matches the legacy Journaliser)
+
+
 def upload_document(
     s: requests.Session,
     *,
@@ -327,17 +336,23 @@ def upload_document(
     folder_path: str = "",
     overwrite: bool = True,
     web: str = "",
+    single_upload_threshold: int = GO_SINGLE_UPLOAD_THRESHOLD,
     timeout: int = 1200,
 ) -> int | None:
-    """Upload a document to a GO case via ``/_goapi/Documents/AddToCase`` and
-    return the new DocId.
+    """Upload a document to a GO case and return its DocId.
 
-    ``Bytes`` is sent as a JSON array of byte values (GO's documented shape). GO
-    silently struggles with very large files this way — the legacy Journaliser
-    falls back to a SharePoint chunked upload above ~10 MB; that fallback isn't
-    ported here, so keep individual uploads modest (delivered redacted PDFs and
-    rendered e-mails are well within range).
+    Files up to ``single_upload_threshold`` go via ``/_goapi/Documents/AddToCase``
+    (``Bytes`` as a JSON array). Larger files are streamed in chunks straight to
+    the case's SharePoint document library (startUpload/continueUpload/
+    finishUpload), then located and given their metadata — the only reliable way
+    to push large files into GO.
     """
+    if len(file_bytes) > single_upload_threshold:
+        return _upload_document_chunked(
+            s, base_url=base_url, case_id=case_id, file_bytes=file_bytes,
+            file_name=file_name, metadata_xml=metadata_xml, folder_path=folder_path,
+            timeout=timeout,
+        )
     url = f"{base_url}{web}/_goapi/Documents/AddToCase"
     payload = {
         "Bytes": list(file_bytes),
@@ -354,6 +369,127 @@ def upload_document(
         return r.json().get("DocId")
     except ValueError:
         return None
+
+
+# --- large-file path: chunked SharePoint upload to the GO case library -------
+
+
+def case_sharepoint_url(s: requests.Session, *, base_url: str, case_id: str, timeout: int = 60) -> str | None:
+    """Return a case's SharePoint web path (``ows_CaseUrl``, e.g. ``cases/AKT/…``)."""
+    r = s.get(f"{base_url}/_goapi/Cases/Metadata/{case_id}/False", timeout=timeout)
+    r.raise_for_status()
+    root = ET.fromstring(r.json()["Metadata"])
+    return root.attrib.get("ows_CaseUrl")
+
+
+def _context_digest(s, base_url, web_path, timeout=60):
+    r = s.post(f"{base_url}/{web_path}/_api/contextinfo",
+               headers={"Accept": "application/json; odata=verbose"}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
+
+
+def _upload_document_chunked(s, *, base_url, case_id, file_bytes, file_name,
+                             metadata_xml, folder_path, timeout):
+    cu = case_sharepoint_url(s, base_url=base_url, case_id=case_id, timeout=timeout)
+    if not cu:
+        raise RuntimeError(f"Could not resolve ows_CaseUrl for GO case {case_id}")
+    digest = _context_digest(s, base_url, cu, timeout)
+    safe_file = file_name.replace("'", "''")
+    safe_folder = (folder_path or "").replace("'", "''")
+    _chunked_file_upload(s, base_url, cu, file_bytes, safe_file, digest, safe_folder, timeout)
+    # GO needs a moment to index the new file before RenderListDataAsStream finds it.
+    doc_id = None
+    for _ in range(6):
+        time.sleep(5)
+        doc_id = _find_docid(s, base_url, cu, file_name, folder_path, timeout)
+        if doc_id is not None:
+            break
+    if doc_id is not None and metadata_xml:
+        try:
+            set_document_metadata(s, base_url=base_url, doc_id=doc_id, metadata_xml=metadata_xml)
+        except requests.RequestException:
+            pass  # the file is uploaded; metadata is best-effort
+    return doc_id
+
+
+def _chunked_file_upload(s, base_url, cu, binary, file_name, digest, folder_path, timeout):
+    web_url = f"{base_url}/{cu}"
+    # Per-request headers (don't pollute the shared session with a stale digest).
+    write_h = {"X-RequestDigest": digest, "X-FORMS_BASED_AUTH_ACCEPTED": "f"}
+    chunk_h = {**write_h, "Content-Type": "application/octet-stream"}
+    target_folder = (f"/{cu}/Dokumenter/{folder_path}".replace("\\", "/")
+                     if folder_path else f"/{cu}/Dokumenter")
+    create_url = (f"{web_url}/_api/web/GetFolderByServerRelativePath(DecodedUrl=@p)/Files/"
+                  f"add(url=@f,overwrite=true)?@p='{target_folder}'&@f='{file_name}'")
+    s.post(create_url, headers=write_h, timeout=timeout).raise_for_status()
+    target = f"{target_folder}%2F{file_name}"
+    uid = str(uuid.uuid4())
+    offset, total = 0, len(binary)
+    base = f"{web_url}/_api/web/GetFileByServerRelativePath(DecodedUrl=@u)"
+    with io.BytesIO(binary) as stream:
+        first = True
+        while True:
+            buf = stream.read(GO_CHUNK_SIZE)
+            if not buf:
+                break
+            if first and len(buf) == total:
+                s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+                s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+                break
+            if first:
+                s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+                first = False
+            elif stream.tell() == total:
+                s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+            else:
+                s.post(f"{base}/continueUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+            offset += len(buf)
+
+
+def _find_docid(s, base_url, cu, file_name, folder_path, timeout):
+    """Locate the DocID of a just-uploaded file by FileLeafRef (paged scan)."""
+    r = s.get(f"{base_url}/{cu}/_goapi/Administration/GetLeftMenuCounter", timeout=timeout)
+    r.raise_for_status()
+    view_id = next((it.get("ViewId") for it in r.json()
+                    if it.get("ViewName") == "AllItems.aspx" and it.get("ListName") == "Dokumenter"), None)
+    if view_id is None:
+        return None
+    list_url = f"'/{cu}/Dokumenter'"
+    root_folder = f"/{cu}/Dokumenter" + (f"/{folder_path}" if folder_path else "")
+    url = (f"{base_url}/{cu}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
+           f"?@listUrl={list_url}&View={view_id}&RootFolder={root_folder}")
+    headers = {"content-type": "application/json;odata=verbose"}
+    payload = json.dumps({"parameters": {"__metadata": {"type": "SP.RenderListDataParameters"},
+                          "ViewXml": '<View><Query></Query><RowLimit Paged="TRUE">100</RowLimit></View>'}})
+    target = str(file_name).lower()
+    while True:
+        r = s.post(url, headers=headers, data=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        for row in data.get("Row", []):
+            if str(row.get("FileLeafRef")).lower() == target:
+                return row.get("DocID")
+        nxt = data.get("NextHref")
+        if not nxt:
+            return None
+        url = (f"{base_url}/{cu}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
+               f"?@listUrl={list_url}{nxt.replace('?', '&', 1)}")
+
+
+_RE_OWS_DATO = re.compile(r'ows_Dato="(\d{2})-(\d{2})-(\d{4})"')
+
+
+def set_document_metadata(s: requests.Session, *, base_url: str, doc_id, metadata_xml: str,
+                          web: str = "", timeout: int = 600) -> requests.Response:
+    """Set a GO document's ows_ metadata. GO's Documents/Metadata expects
+    ``ows_Dato`` as MM-DD-YYYY, so a DD-MM-YYYY value is flipped before sending."""
+    metadata_xml = _RE_OWS_DATO.sub(
+        lambda m: f'ows_Dato="{m.group(2)}-{m.group(1)}-{m.group(3)}"', metadata_xml)
+    r = s.post(f"{base_url}{web}/_goapi/Documents/Metadata",
+               data={"DocId": doc_id, "MetadataXml": metadata_xml}, timeout=timeout)
+    r.raise_for_status()
+    return r
 
 
 def mark_as_case_record(
@@ -379,10 +515,12 @@ def mark_as_case_record(
 #   1. fetch a FormDigest for the root web (PeoplePicker) and for the case web,
 #   2. PeoplePicker-search the user by e-mail,
 #   3. ValidateUpdateListItem the case's list item with the CaseOwner field.
-# Ported from the caseworker's proven script. The ``case_group`` path segment in
-# the ModernConfiguration URL is tenant-specific — pass the value GO uses for
-# the case's folder; set_case_owner is best-effort (callers should not fail the
-# whole journalisation if it raises).
+# Ported from the caseworker's proven script. The ModernConfiguration lookup
+# uses the case's web path (CaseRelativeUrl from create_case, == ows_CaseUrl) —
+# in the legacy code that was /cases/{aktnr}/{aktid} where
+# aktnr = CaseRelativeUrl.split('/')[-2] and aktid = CaseID, i.e. the same path.
+# set_case_owner is best-effort (callers should not fail the whole journalisation
+# if it raises).
 # ---------------------------------------------------------------------------
 
 
@@ -417,8 +555,11 @@ def search_user(s: requests.Session, root_url: str, digest: str, email: str, tim
     return None
 
 
-def _modern_list_and_item(s, base_url, case_id, case_group, timeout=60):
-    endpoint = f"{base_url}/cases/{case_group}/{case_id}/_goapi/Administration/ModernConfiguration"
+def _modern_list_and_item(s, base_url, case_relative_url, timeout=60):
+    """Return (list name, list-item id) for a case from its ModernConfiguration.
+    ``case_relative_url`` is the case web path (CaseRelativeUrl / ows_CaseUrl),
+    e.g. ``cases/AKT-2026/AKT-2026-000782``."""
+    endpoint = f"{base_url}/{case_relative_url}/_goapi/Administration/ModernConfiguration"
     payload = {"providerTypes": ["ModernCase", "MoveDocument", "Insight", "SearchSystem", "UserSettings"]}
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     last = ""
@@ -430,7 +571,7 @@ def _modern_list_and_item(s, base_url, case_id, case_group, timeout=60):
             return caselist, mc.get("ListItemID")
         last = (r.text or "")[:200]
         time.sleep(5)
-    raise RuntimeError(f"GO ModernConfiguration empty after 5 tries for {case_id}: {last}")
+    raise RuntimeError(f"GO ModernConfiguration empty after 5 tries for {case_relative_url}: {last}")
 
 
 def set_case_owner(
@@ -438,20 +579,29 @@ def set_case_owner(
     *,
     base_url: str,
     case_id: str,
-    case_group: str,
     caseworker_email: str,
+    case_relative_url: str | None = None,
     case_web: str = "/aktindsigt",
     timeout: int = 60,
 ) -> bool:
     """Set the GO CaseOwner of ``case_id`` to the user with ``caseworker_email``.
 
+    ``case_relative_url`` is the case web path (the create response's
+    ``CaseRelativeUrl``, e.g. ``cases/AKT-2026/AKT-2026-000782``); if omitted it's
+    resolved from ``ows_CaseUrl``. The ModernConfiguration lookup runs against
+    that path, the CaseOwner update against ``case_web`` (the /aktindsigt list).
+
     Returns True on success, False if no matching user was found. Raises on HTTP
     errors — callers should treat this as best-effort and not fail the whole
     journalisation if it raises (the case still exists; the owner can be set in
     GO manually)."""
+    if not case_relative_url:
+        case_relative_url = case_sharepoint_url(s, base_url=base_url, case_id=case_id, timeout=timeout)
+    if not case_relative_url:
+        raise RuntimeError(f"Could not resolve the case web path for {case_id}")
     root_digest = _form_digest(s, base_url, timeout)
     case_digest = _form_digest(s, f"{base_url}{case_web}", timeout)
-    listnumber, item_id = _modern_list_and_item(s, base_url, case_id, case_group, timeout)
+    listnumber, item_id = _modern_list_and_item(s, base_url, case_relative_url, timeout)
     entity = search_user(s, base_url, root_digest, caseworker_email, timeout)
     if not entity:
         return False
