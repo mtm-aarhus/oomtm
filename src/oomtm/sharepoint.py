@@ -239,6 +239,37 @@ def list_folder(ctx: "ClientContext", server_relative_path: str) -> list[str]:
     return [f.properties.get("Name") for f in files]
 
 
+def list_files_recursive(ctx: "ClientContext", server_relative_path: str) -> list[dict]:
+    """Return every file under ``server_relative_path`` (recursively) as
+    ``[{"path": <server-relative url>, "name": <filename>}, …]``.
+
+    Used to journalise a whole delivery folder onto a GO case — including files
+    a caseworker added in SharePoint by hand. A missing folder yields ``[]``.
+    """
+    results: list[dict] = []
+    if not folder_exists(ctx, server_relative_path):
+        return results
+
+    def _walk(path: str) -> None:
+        folder = ctx.web.get_folder_by_server_relative_url(path)
+        files = folder.files
+        subfolders = folder.folders
+        ctx.load(files)
+        ctx.load(subfolders)
+        ctx.execute_query()
+        for f in files:
+            url = f.properties.get("ServerRelativeUrl")
+            if url:
+                results.append({"path": url, "name": f.properties.get("Name")})
+        for sub in subfolders:
+            sub_path = sub.properties.get("ServerRelativeUrl")
+            if sub_path:
+                _walk(sub_path)
+
+    _walk(server_relative_path)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # File ops
 # ---------------------------------------------------------------------------

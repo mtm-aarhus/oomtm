@@ -508,6 +508,28 @@ def mark_as_case_record(
     return r
 
 
+def delete_document(
+    s: requests.Session,
+    *,
+    base_url: str,
+    doc_id,
+    force_delete: bool = True,
+    web: str = "",
+    timeout: int = 120,
+) -> requests.Response:
+    """Delete a document from GO by DocId (``DELETE /_goapi/Documents/ByDocumentId``).
+
+    ``force_delete`` removes it even if it's checked out / finalised / a case
+    record — needed because we mark journalised docs as case records. A document
+    that's already gone counts as success (idempotent)."""
+    url = f"{base_url}{web}/_goapi/Documents/ByDocumentId"
+    r = s.delete(url, data=json.dumps({"DocId": doc_id, "ForceDelete": force_delete}), timeout=timeout)
+    if r.status_code in (404,) or (r.status_code == 200 and "does not exist" in (r.text or "").lower()):
+        return r
+    r.raise_for_status()
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Case owner — set the GO CaseOwner from an e-mail (the PeoplePicker "hack").
 #
