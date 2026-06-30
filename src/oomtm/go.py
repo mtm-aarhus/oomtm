@@ -255,8 +255,10 @@ def create_case(
 
     * ``CaseID``          — e.g. ``"AKT-2026-000782"``
     * ``CaseRelativeUrl`` — the case's web path, e.g.
-      ``"cases/AKT-2026/AKT-2026-000782"`` — pass it to :func:`set_case_owner`
-      (it's the ``{aktnr}/{aktid}`` ModernConfiguration path).
+      ``"cases/AKT55/AKT-2026-000782"`` (the middle segment is a per-case prefix
+      GO assigns, unique per case) — pass it to :func:`set_case_owner` (it's the
+      ``{aktnr}/{aktid}`` ModernConfiguration path) and use it to build the
+      browser link, since the prefix isn't derivable from the case number.
 
     ``metadata_xml`` is the ``<z:row …/>`` payload with the ows_ attributes for
     the new case (Title, Sagsprofil, Facet, Modtaget, …). ``web`` is the case web
