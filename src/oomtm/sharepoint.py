@@ -344,6 +344,20 @@ def delete_file(ctx: "ClientContext", file_path: str) -> None:
     file.delete_object().execute_query()
 
 
+def rename_file(ctx: "ClientContext", file_path: str, new_name: str) -> str:
+    """Rename a file in place (same folder), returning its new server-relative
+    path. No-op if ``new_name`` already matches the current leaf. Overwrites a
+    same-named file if one exists (the name is unique per document, so that's the
+    same doc — makes retries idempotent)."""
+    parent, _, current = file_path.rpartition("/")
+    if not new_name or new_name == current:
+        return file_path
+    new_path = f"{parent}/{new_name}"
+    file = ctx.web.get_file_by_server_relative_url(file_path)
+    file.moveto(new_path, 1).execute_query()  # flag 1 = overwrite
+    return new_path
+
+
 def delete_folder_recursive(ctx: "ClientContext", folder_path: str) -> bool:
     """Delete a folder and everything under it, bottom-up: files first, then
     subfolders (recursively), then the folder itself.
