@@ -337,22 +337,39 @@ def upload_document(
     overwrite: bool = True,
     web: str = "",
     single_upload_threshold: int = GO_SINGLE_UPLOAD_THRESHOLD,
+    created_folders: set | None = None,
     timeout: int = 1200,
 ) -> int | None:
     """Upload a document to a GO case and return its DocId.
 
     Files up to ``single_upload_threshold`` go via ``/_goapi/Documents/AddToCase``
-    (``Bytes`` as a JSON array). Larger files are streamed in chunks straight to
-    the case's SharePoint document library (startUpload/continueUpload/
-    finishUpload), then located and given their metadata — the only reliable way
-    to push large files into GO.
+    (``Bytes`` as a JSON array), which creates ``folder_path`` on the case itself
+    if it doesn't exist yet. Larger files — or files ``AddToCase`` rejects — are
+    streamed in chunks straight to the case's SharePoint document library
+    (startUpload/continueUpload/finishUpload), then located and given their
+    metadata. That chunked path uploads to SharePoint directly, which won't
+    create the target sub-folder, so it makes a placeholder folder first; pass a
+    shared ``created_folders`` set to skip that check for a ``folder_path``
+    already created earlier in the run.
     """
-    if len(file_bytes) > single_upload_threshold:
-        return _upload_document_chunked(
-            s, base_url=base_url, case_id=case_id, file_bytes=file_bytes,
-            file_name=file_name, metadata_xml=metadata_xml, folder_path=folder_path,
-            timeout=timeout,
-        )
+    if len(file_bytes) <= single_upload_threshold:
+        try:
+            return _add_to_case(
+                s, base_url=base_url, web=web, case_id=case_id, file_bytes=file_bytes,
+                file_name=file_name, metadata_xml=metadata_xml, list_name=list_name,
+                folder_path=folder_path, overwrite=overwrite, timeout=timeout,
+            )
+        except requests.RequestException:
+            pass  # AddToCase failed — fall back to the chunked SharePoint upload
+    return _upload_document_chunked(
+        s, base_url=base_url, case_id=case_id, file_bytes=file_bytes,
+        file_name=file_name, metadata_xml=metadata_xml, folder_path=folder_path,
+        created_folders=created_folders, timeout=timeout,
+    )
+
+
+def _add_to_case(s, *, base_url, web, case_id, file_bytes, file_name, metadata_xml,
+                 list_name, folder_path, overwrite, timeout):
     url = f"{base_url}{web}/_goapi/Documents/AddToCase"
     payload = {
         "Bytes": list(file_bytes),
@@ -390,14 +407,15 @@ def _context_digest(s, base_url, web_path, timeout=60):
 
 
 def _upload_document_chunked(s, *, base_url, case_id, file_bytes, file_name,
-                             metadata_xml, folder_path, timeout):
+                             metadata_xml, folder_path, created_folders=None, timeout):
     cu = case_sharepoint_url(s, base_url=base_url, case_id=case_id, timeout=timeout)
     if not cu:
         raise RuntimeError(f"Could not resolve ows_CaseUrl for GO case {case_id}")
     digest = _context_digest(s, base_url, cu, timeout)
     safe_file = file_name.replace("'", "''")
     safe_folder = (folder_path or "").replace("'", "''")
-    _chunked_file_upload(s, base_url, cu, file_bytes, safe_file, digest, safe_folder, timeout)
+    _chunked_file_upload(s, base_url, cu, file_bytes, safe_file, digest, safe_folder,
+                         created_folders, timeout)
     # GO needs a moment to index the new file before RenderListDataAsStream finds it.
     doc_id = None
     for _ in range(6):
@@ -413,13 +431,51 @@ def _upload_document_chunked(s, *, base_url, case_id, file_bytes, file_name,
     return doc_id
 
 
-def _chunked_file_upload(s, base_url, cu, binary, file_name, digest, folder_path, timeout):
+def _go_folder_exists(s, web_url, server_relative, timeout):
+    """True iff a folder exists at ``server_relative`` (HTTP 200); any other
+    response — 404, error — is treated as 'not there, try to create it'."""
+    try:
+        r = s.get(f"{web_url}/_api/web/GetFolderByServerRelativePath(DecodedUrl=@p)?@p='{server_relative}'",
+                  headers={"Accept": "application/json; odata=verbose"}, timeout=timeout)
+    except requests.RequestException:
+        return False
+    return r.status_code == 200
+
+
+def _ensure_case_folder(s, web_url, cu, folder_path, digest, timeout):
+    """Create ``folder_path`` under the case's ``Dokumenter`` library if missing,
+    one segment at a time (``AddUsingPath`` needs the parent to exist). Idempotent
+    — an already-existing folder is fine. Only the chunked upload path needs this;
+    ``AddToCase`` creates folders itself. ``folder_path`` is already apostrophe-
+    escaped for the OData literal by the caller."""
+    write_h = {"X-RequestDigest": digest, "X-FORMS_BASED_AUTH_ACCEPTED": "f",
+               "Accept": "application/json; odata=verbose"}
+    parent = f"/{cu}/Dokumenter"
+    for seg in [p for p in folder_path.replace("\\", "/").split("/") if p]:
+        target = f"{parent}/{seg}"
+        url = f"{web_url}/_api/web/folders/AddUsingPath(DecodedUrl=@p)?@p='{target}'"
+        r = s.post(url, headers=write_h, timeout=timeout)
+        # 200/201 = created. Otherwise it may already exist (created by an earlier
+        # run) — accept that; only raise if it's genuinely not there.
+        if r.status_code not in (200, 201) and not _go_folder_exists(s, web_url, target, timeout):
+            r.raise_for_status()
+        parent = target
+
+
+def _chunked_file_upload(s, base_url, cu, binary, file_name, digest, folder_path,
+                         created_folders, timeout):
     web_url = f"{base_url}/{cu}"
     # Per-request headers (don't pollute the shared session with a stale digest).
     write_h = {"X-RequestDigest": digest, "X-FORMS_BASED_AUTH_ACCEPTED": "f"}
     chunk_h = {**write_h, "Content-Type": "application/octet-stream"}
     target_folder = (f"/{cu}/Dokumenter/{folder_path}".replace("\\", "/")
                      if folder_path else f"/{cu}/Dokumenter")
+    # SharePoint won't create the sub-folder on Files/add, so make a placeholder
+    # first — once per folder path per run (the AddToCase path doesn't need this).
+    if folder_path and (created_folders is None or folder_path not in created_folders):
+        _ensure_case_folder(s, web_url, cu, folder_path, digest, timeout)
+        if created_folders is not None:
+            created_folders.add(folder_path)
     create_url = (f"{web_url}/_api/web/GetFolderByServerRelativePath(DecodedUrl=@p)/Files/"
                   f"add(url=@f,overwrite=true)?@p='{target_folder}'&@f='{file_name}'")
     s.post(create_url, headers=write_h, timeout=timeout).raise_for_status()
