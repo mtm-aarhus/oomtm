@@ -289,12 +289,15 @@ def upload_file(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     single_upload_threshold: int = DEFAULT_SINGLE_UPLOAD_THRESHOLD,
     progress_cb=None,
-) -> None:
+) -> "str | None":
     """Upload ``local_file`` to the given SharePoint folder.
 
     Uses a single PUT for files <= ``single_upload_threshold``; falls back to
     chunked upload via ``create_upload_session`` for larger files (or if the
     single-PUT path raises).
+
+    Returns the uploaded file's **UniqueId** (a stable GUID that survives later
+    renames/moves), so callers can track the file by id instead of by name.
     """
     folder = ctx.web.get_folder_by_server_relative_path(folder_path)
     ctx.load(folder)
@@ -303,23 +306,66 @@ def upload_file(
     file_name = os.path.basename(local_file)
     file_size = os.path.getsize(local_file)
 
+    uploaded = None
     if file_size <= single_upload_threshold:
         try:
             with open(local_file, "rb") as fh:
-                folder.files.add(file_name, fh.read(), overwrite=overwrite).execute_query()
+                uploaded = folder.files.add(file_name, fh.read(), overwrite=overwrite)
+            uploaded.execute_query()
             if progress_cb:
                 progress_cb(file_size, file_size)
-            return
         except Exception:  # pylint: disable=broad-except
-            # Fall through to chunked upload
-            pass
+            uploaded = None  # fall through to chunked upload
 
-    def _progress(offset: int) -> None:
-        if progress_cb:
-            progress_cb(offset, file_size)
+    if uploaded is None:
+        def _progress(offset: int) -> None:
+            if progress_cb:
+                progress_cb(offset, file_size)
+        with open(local_file, "rb") as fh:
+            uploaded = folder.files.create_upload_session(fh, chunk_size, _progress)
+        uploaded.execute_query()
 
-    with open(local_file, "rb") as fh:
-        folder.files.create_upload_session(fh, chunk_size, _progress).execute_query()
+    return _unique_id_of(ctx, uploaded)
+
+
+def _unique_id_of(ctx: "ClientContext", obj) -> "str | None":
+    """Read a File/Folder's UniqueId (GUID) as a string, or None on any error."""
+    try:
+        ctx.load(obj, ["UniqueId"])
+        ctx.execute_query()
+        uid = obj.properties.get("UniqueId")
+        return str(uid) if uid else None
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def file_path_by_id(ctx: "ClientContext", file_id: str) -> "str | None":
+    """Current server-relative path of a file from its stable UniqueId, or None if
+    it no longer exists. Survives renames/moves within the site — resolve this
+    before any rename/replace/delete so a manually-moved file is still found."""
+    if not file_id:
+        return None
+    try:
+        f = ctx.web.get_file_by_id(file_id)
+        ctx.load(f, ["ServerRelativeUrl"])
+        ctx.execute_query()
+        return f.properties.get("ServerRelativeUrl")
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def folder_path_by_id(ctx: "ClientContext", folder_id: str) -> "str | None":
+    """Current server-relative path of a folder from its stable UniqueId, or None
+    if it no longer exists. Survives a caseworker renaming the folder."""
+    if not folder_id:
+        return None
+    try:
+        fo = ctx.web.get_folder_by_id(folder_id)
+        ctx.load(fo, ["ServerRelativeUrl"])
+        ctx.execute_query()
+        return fo.properties.get("ServerRelativeUrl")
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 def download_file(
@@ -406,17 +452,19 @@ def upload_to_case_folder(
     undermappe: str,
     local_file: str,
     overwrite: bool = True,
-) -> str:
+) -> dict:
     """Ensure ``library/overmappe/undermappe`` exists and upload ``local_file``
-    into it. Returns the file's server-relative path.
+    into it. Returns ``{"path": <server-relative file path>, "file_id": <UniqueId
+    or None>}`` — track the id so later rename/replace/delete find the file even
+    if it's been renamed/moved.
 
     This is the one-call path the KontAKT ToPDF robots use: build folder path →
     ensure both folder levels exist → (chunked) upload.
     """
     parent = build_server_relative_path(site_url, library)
     folder_path = ensure_folder(ctx, parent_path=parent, segments=[overmappe, undermappe])
-    upload_file(ctx, folder_path=folder_path, local_file=local_file, overwrite=overwrite)
-    return f"{folder_path}/{os.path.basename(local_file)}"
+    file_id = upload_file(ctx, folder_path=folder_path, local_file=local_file, overwrite=overwrite)
+    return {"path": f"{folder_path}/{os.path.basename(local_file)}", "file_id": file_id}
 
 
 def file_browser_url(site_url: str, file_server_relative_path: str) -> str:
