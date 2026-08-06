@@ -566,6 +566,17 @@ def mark_as_case_record(
     return r
 
 
+# Bodies GO answers with when the document simply isn't there any more. The
+# status code it uses for that varies, so the text is what decides.
+_GONE_MARKERS = ("does not exist", "not found", "findes ikke", "kunne ikke findes",
+                 "cannot be found", "no document")
+
+
+def _is_gone(r: requests.Response) -> bool:
+    body = (r.text or "").lower()
+    return any(m in body for m in _GONE_MARKERS)
+
+
 def delete_document(
     s: requests.Session,
     *,
@@ -579,12 +590,30 @@ def delete_document(
 
     ``force_delete`` removes it even if it's checked out / finalised / a case
     record — needed because we mark journalised docs as case records. A document
-    that's already gone counts as success (idempotent)."""
+    that's already gone counts as success (idempotent).
+
+    ``doc_id`` is coerced to int. The API documents DocId as an Int, and a JSON
+    string fails inside GO's model binding — which surfaces as a bare
+    "500 Server Error" rather than a helpful 400. Every other call here gets its
+    ids straight from a GO response (already ints); this one gets them back from a
+    caller that stored them as text, so the coercion belongs here.
+    """
+    try:
+        doc_id_int = int(str(doc_id).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"delete_document: DocId skal være et tal, fik {doc_id!r}") from None
     url = f"{base_url}{web}/_goapi/Documents/ByDocumentId"
-    r = s.delete(url, data=json.dumps({"DocId": doc_id, "ForceDelete": force_delete}), timeout=timeout)
-    if r.status_code in (404,) or (r.status_code == 200 and "does not exist" in (r.text or "").lower()):
+    r = s.delete(url,
+                 data=json.dumps({"DocId": doc_id_int, "ForceDelete": bool(force_delete)}),
+                 timeout=timeout)
+    if r.status_code == 404 or _is_gone(r):
         return r
-    r.raise_for_status()
+    if not r.ok:
+        # raise_for_status() alone throws away GO's own explanation, which is the
+        # only thing that says WHY it refused.
+        raise requests.HTTPError(
+            f"{r.status_code} {r.reason} on DELETE {url} (DocId={doc_id_int}): "
+            f"{(r.text or '').strip()[:600]}", response=r)
     return r
 
 
