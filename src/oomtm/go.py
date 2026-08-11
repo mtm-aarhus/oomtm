@@ -20,6 +20,7 @@ All functions are stateless; the caller manages the session lifetime.
 from __future__ import annotations
 
 import io
+import os
 import json
 import re
 import time
@@ -331,8 +332,9 @@ def upload_document(
     *,
     base_url: str,
     case_id: str,
-    file_bytes: bytes,
     file_name: str,
+    file_bytes: bytes | None = None,
+    file_path: str | os.PathLike | None = None,
     metadata_xml: str = '<z:row xmlns:z="#RowsetSchema"/>',
     list_name: str = "Dokumenter",
     folder_path: str = "",
@@ -354,7 +356,16 @@ def upload_document(
     shared ``created_folders`` set to skip that check for a ``folder_path``
     already created earlier in the run.
     """
-    if len(file_bytes) <= single_upload_threshold:
+    if file_bytes is None and file_path is None:
+        raise ValueError("upload_document needs either file_bytes or file_path")
+    total = len(file_bytes) if file_bytes is not None else os.path.getsize(file_path)
+    if total <= single_upload_threshold:
+        # AddToCase sends the bytes as a JSON array of integers, so this path costs
+        # roughly ten times the file size in memory. That is exactly why it is only
+        # used for small files — and why the bytes are only read here.
+        if file_bytes is None:
+            with open(file_path, "rb") as fh:
+                file_bytes = fh.read()
         try:
             return _add_to_case(
                 s, base_url=base_url, web=web, case_id=case_id, file_bytes=file_bytes,
@@ -365,6 +376,7 @@ def upload_document(
             pass  # AddToCase failed — fall back to the chunked SharePoint upload
     return _upload_document_chunked(
         s, base_url=base_url, case_id=case_id, file_bytes=file_bytes,
+        file_path=file_path, total=total,
         file_name=file_name, metadata_xml=metadata_xml, folder_path=folder_path,
         created_folders=created_folders, timeout=timeout,
     )
@@ -408,16 +420,26 @@ def _context_digest(s, base_url, web_path, timeout=60):
     return r.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
 
 
-def _upload_document_chunked(s, *, base_url, case_id, file_bytes, file_name,
-                             metadata_xml, folder_path, created_folders=None, timeout):
+def _upload_document_chunked(s, *, base_url, case_id, file_name, metadata_xml,
+                             folder_path, file_bytes=None, file_path=None, total=None,
+                             created_folders=None, timeout, on_progress=None):
     cu = case_sharepoint_url(s, base_url=base_url, case_id=case_id, timeout=timeout)
     if not cu:
         raise RuntimeError(f"Could not resolve ows_CaseUrl for GO case {case_id}")
     digest = _context_digest(s, base_url, cu, timeout)
     safe_file = file_name.replace("'", "''")
     safe_folder = (folder_path or "").replace("'", "''")
-    _chunked_file_upload(s, base_url, cu, file_bytes, safe_file, digest, safe_folder,
-                         created_folders, timeout)
+    # A path streams; bytes are wrapped so callers that already hold them still work.
+    # Streaming is the difference between a 2 GB video costing 2 GB of RSS and
+    # costing 8 MB of it.
+    if file_path is not None:
+        with open(file_path, "rb") as fh:
+            _chunked_file_upload(s, base_url, cu, fh, total, safe_file, digest,
+                                 safe_folder, created_folders, timeout, on_progress)
+    else:
+        with io.BytesIO(file_bytes) as fh:
+            _chunked_file_upload(s, base_url, cu, fh, len(file_bytes), safe_file, digest,
+                                 safe_folder, created_folders, timeout, on_progress)
     # GO needs a moment to index the new file before RenderListDataAsStream finds it.
     doc_id = None
     for _ in range(6):
@@ -464,8 +486,14 @@ def _ensure_case_folder(s, web_url, cu, folder_path, digest, timeout):
         parent = target
 
 
-def _chunked_file_upload(s, base_url, cu, binary, file_name, digest, folder_path,
-                         created_folders, timeout):
+def _chunked_file_upload(s, base_url, cu, stream, total, file_name, digest, folder_path,
+                         created_folders, timeout, on_progress=None):
+    """Upload ``stream`` to SharePoint in GO_CHUNK_SIZE pieces.
+
+    Reads from the stream a chunk at a time and never holds the whole file, so the
+    memory cost is one chunk regardless of the file's size. ``on_progress(sent,
+    total)`` is called after each piece, for a caller that wants to report how far
+    it has got."""
     web_url = f"{base_url}/{cu}"
     # Per-request headers (don't pollute the shared session with a stale digest).
     write_h = {"X-RequestDigest": digest, "X-FORMS_BASED_AUTH_ACCEPTED": "f"}
@@ -483,26 +511,31 @@ def _chunked_file_upload(s, base_url, cu, binary, file_name, digest, folder_path
     s.post(create_url, headers=write_h, timeout=timeout).raise_for_status()
     target = f"{target_folder}%2F{file_name}"
     uid = str(uuid.uuid4())
-    offset, total = 0, len(binary)
+    offset = 0
     base = f"{web_url}/_api/web/GetFileByServerRelativePath(DecodedUrl=@u)"
-    with io.BytesIO(binary) as stream:
-        first = True
-        while True:
-            buf = stream.read(GO_CHUNK_SIZE)
-            if not buf:
-                break
-            if first and len(buf) == total:
-                s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
-                s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
-                break
-            if first:
-                s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
-                first = False
-            elif stream.tell() == total:
-                s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
-            else:
-                s.post(f"{base}/continueUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
-            offset += len(buf)
+    first = True
+    while True:
+        buf = stream.read(GO_CHUNK_SIZE)
+        if not buf:
+            break
+        sent = offset + len(buf)
+        if first and sent == total:
+            s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+            s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+            offset = sent
+            if on_progress:
+                on_progress(offset, total)
+            break
+        if first:
+            s.post(f"{base}/startUpload(uploadId=guid'{uid}')?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+            first = False
+        elif sent >= total:
+            s.post(f"{base}/finishUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+        else:
+            s.post(f"{base}/continueUpload(uploadId=guid'{uid}',fileOffset={offset})?@u='{target}'", data=buf, headers=chunk_h, timeout=timeout).raise_for_status()
+        offset = sent
+        if on_progress:
+            on_progress(offset, total)
 
 
 def _find_docid(s, base_url, cu, file_name, folder_path, timeout):
