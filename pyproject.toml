@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "oomtm"
 version = "0.2.0"
-description = "Shared library for MTM (Aarhus Kommune) OpenOrchestrator processes — SharePoint, GO, Nova, PDF tooling."
+description = "Shared library for MTM (Aarhus Kommune) OpenOrchestrator processes — F2, SharePoint, GO, Nova, PDF tooling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
