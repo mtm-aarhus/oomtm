@@ -222,7 +222,7 @@ class Config:
         her, så et skifte til produktion er én constant:
 
             F2Miljoe          "test" eller "prod"   (mangler den: test)
-            F2RestTestURL     værten, uden https://
+            F2RestTestURL     værten. Med eller uden https:// - se base()
             F2RestProdURL     ditto
             F2TESTRestAkt     credential: klient-id + hemmelighed
             F2PRODRestAkt     ditto
