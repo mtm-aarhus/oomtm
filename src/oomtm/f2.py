@@ -12,7 +12,7 @@ er pip-installeret på robotmaskinerne, så de skal ikke have hver sin kopi - og
 
 Hvorfor originalen ligger her og ikke i biblioteket: alt, hvad vi VED om F2, er
 målt her. Testene (``tests/test_f2_rest.py``, 76 checks) og protokollen over
-hver måling (``F2-TESTLOG.md``) ligger i dette repo, og det er her, filen bliver
+hver måling (``MDFiles/F2-TESTLOG.md``) ligger i dette repo, og det er her, filen bliver
 ved med at blive rettet. Ret her, og kopiér ud til oomtm igen.
 
 Modulet importerer med vilje ikke noget fra ``app``: så kan det kopieres som det
@@ -49,7 +49,7 @@ POST ONCE EXACTLY (PEO) - HVORFOR ALT OPRETTES I TO TRIN
     påstår. ``poe()`` tager begge.
 
 DE MÅLTE FALDGRUBER
-    Alt herunder er prøvet mod aak-esdh-test-mob, ikke læst. Se F2-TESTLOG.md.
+    Alt herunder er prøvet mod aak-esdh-test-mob, ikke læst. Se MDFiles/F2-TESTLOG.md.
 
     SKRIVERETTEN PÅ EN AKT har to betingelser, og de skal begge være opfyldt.
         Målt på 42 akter fordelt på 12 sager, med ``PATCH /Title`` som prøve:
@@ -86,13 +86,21 @@ DE MÅLTE FALDGRUBER
         samme 42 akter: hver akt med ``Archived=true`` har et nummer, ingen med
         ``Archived=false`` har et. Det er nummeret, en sagsbehandler ser i F2.
 
-    ET DOKUMENT KAN IKKE FJERNES. Det har slet ingen slette-relation - kun
-        ``content``, ``pdf-content``, ``pdf-content-flattened``,
-        ``text-content``, ``upload-validation``, ``self``, ``up``, ``alternate``.
-        Titlen kan derimod PATCHes, og det er hvad ``mark_superseded`` bruger:
-        et dokument, der er trukket ud af udleveringen, mærkes i stedet for at
-        forsvinde. Aktlisten - som også journaliseres - er det autoritative
-        indeks over, hvad der faktisk blev udleveret.
+    ET DOKUMENT KAN SLETTES - MED ``DELETE``, IKKE MED EN RELATION. Målt
+        2026-09-10: ``DELETE`` på dokumentets egen ``self``-URL svarer **204**,
+        og et GET bagefter giver 403. Det gælder dokumenter på en akt, der
+        hverken er arkiveret eller låst; på en arkiveret akt giver det 403.
+
+        Link-relationerne nævner det ikke - et dokument har kun ``content``,
+        ``pdf-content``, ``pdf-content-flattened``, ``text-content``,
+        ``upload-validation``, ``self``, ``up``, ``alternate``. Her stod derfor i
+        en periode, at et dokument slet ikke kunne fjernes. Det var forkert:
+        **fraværet af et link er ikke fraværet af en metode.** cBrain gjorde
+        opmærksom på det.
+
+        Titlen kan også PATCHes, og det er reservevejen i ``remove_document``,
+        når akten er arkiveret. Aktlisten - som også journaliseres - er under
+        alle omstændigheder det autoritative indeks over det udleverede.
 
     F2 RENDERER SELV TIL PDF. ``rel/pdf-content`` lavede en 52-byte text/plain
         om til en rigtig PDF. Det betyder, at ingen robot behøver LibreOffice for
@@ -697,23 +705,156 @@ class F2:
                           f"{text(opdateret, 'Title')!r}")
         return opdateret
 
-    def mark_superseded(self, document, praefiks: str = SUPERSEDED):
-        """Mærk et dokument som trukket ud af udleveringen.
+    def remove_document(self, document, praefiks: str = SUPERSEDED):
+        """Fjern et dokument, der er trukket ud af udleveringen.
 
-        Et journaliseret dokument kan ikke fjernes - det har ingen
-        slette-relation. Så når en sagsbehandler trækker et dokument ud, eller
-        en ny udgave erstatter det, bliver det gamle mærket i stedet for at
-        forsvinde. F2-sagen fortæller så historien i stedet for at blive skrevet
-        om, og aktlisten, der journaliseres ved samme kørsel, er det
-        autoritative indeks over hvad der faktisk blev udleveret.
+        Returnerer ``"deleted"`` eller ``"marked"`` - hvad der faktisk skete.
 
-        Idempotent: et dokument, der allerede er mærket, bliver ikke mærket to
-        gange. Robotten kan køre samme køelement igen.
+        SLETNING ER DET RIGTIGE UDFALD, og den virker. Målt 2026-09-10:
+        ``DELETE`` på dokumentets egen ``self``-URL svarer **204**, og et GET
+        bagefter giver 403 - det er væk. Prøvet på tre dokumenter, heraf to som
+        robotten selv havde journaliseret på en udleveringsakt.
+
+        En tidligere udgave af den her metode hed ``mark_superseded`` og
+        påstod, at et journaliseret dokument "ikke kan fjernes - det har ingen
+        slette-relation". Det var forkert, og fejlen er værd at kende:
+        **link-relationerne annoncerer ikke almindelig HTTP DELETE.** Fraværet
+        af et ``rel/…delete`` er ikke fraværet af metoden. cBrain gjorde
+        opmærksom på det.
+
+        MEN DET VIRKER IKKE OVERALT. Anmodnings-aktens hoveddokument gav 403.
+        Den akt er både arkiveret OG ``DocumentsLocked`` - og låsen er den
+        sandsynlige årsag: en akt, der var **arkiveret men ulåst**, tillod både
+        at lægge et dokument på og at slette det igen (målt 2026-09-10). Så
+        arkivering alene blokerer ikke.
+
+        Robottens udleveringsakt er med vilje ulåst - vi undlader ``SentDate``,
+        se ``create_matter`` - så dér virker sletningen. Men "med vilje" er ikke
+        det samme som "altid": bliver akten låst ad en vej, vi ikke kender, skal
+        robotten ikke fejle.
+
+        Derfor faldes der tilbage på at MÆRKE dokumentet ``UDGÅET - …``. Det er
+        ikke lige så godt - dokumentet ligger der stadig - men det er langt
+        bedre end at lade en fil stå, som ser udleveret ud uden at være det.
+        Aktlisten, der journaliseres i samme kørsel, er under alle
+        omstændigheder det autoritative indeks.
+
+        Idempotent på begge veje: et dokument, der allerede er væk, og et der
+        allerede er mærket, giver samme svar igen.
         """
+        selv = links(document).get("self", "")
+        if not selv:
+            raise F2Error("DELETE", "(intet self-link)", 0,
+                          "dokumentet har ingen self-relation at slette på")
+        try:
+            self.call("DELETE", selv, expect=(200, 202, 204))
+            return "deleted"
+        except F2Error as exc:
+            # 403/404: arkiveret akt, eller allerede væk. Ikke en fejl her -
+            # kun et signal om at tage den anden vej.
+            if exc.status not in (403, 404, 405, 409):
+                raise
+            self.log(f"DELETE af dokument gav {exc.status} - mærker det i stedet.")
+
         titel = text(document, "Title")
-        if titel.startswith(praefiks):
-            return document
-        return self.set_title(document, f"{praefiks}{titel}")
+        if not titel.startswith(praefiks):
+            self.set_title(document, f"{praefiks}{titel}")
+        return "marked"
+
+    # -- organisationen ----------------------------------------------------
+    def party_by_number(self, party_no) -> Optional[dict]:
+        """Parten med dette partynummer, eller None.
+
+        ``party-by-party-number`` svarer **303 See Other** og peger videre med
+        ``Location``. Følger man ikke det, får man et tomt svar og tror, at
+        parten ikke findes - den fælde kostede tre forsøg 2026-09-10.
+        """
+        skabelon = self.rel("party-by-party-number")
+        try:
+            r = self.call("GET", skabelon.replace("{partyNo}", str(party_no)),
+                          headers={"Accept": "*/*"}, expect=(200, 303))
+        except F2Error:
+            return None
+        if r.status_code == 303:
+            sted = r.headers.get("Location")
+            if not sted:
+                return None
+            r = self.call("GET", sted, headers={"Accept": "*/*"})
+        return ET.fromstring(r.content) if r.content else None
+
+    def sub_parties(self, party) -> list:
+        """Partens børn: underenheder OG mennesker, blandet.
+
+        F2 svarer ``<SubParties><Items><Party>`` - og bemærk, at et
+        party-endpoint ét andet sted pakker hver part i et element med partens
+        TYPE som navn (``<Parties><Items><User>``). Elementnavnene er ikke ens
+        på tværs, så her læses ``<Party>``.
+
+        Hver post har ``Type`` (``Unit`` eller ``User``), ``PartyNumber`` og
+        ``Id`` - og det er **ikke** det samme tal: "By og Natur" har
+        PartyNumber 134 og Id 634480. Det er PARTYNUMMERET, resten af F2 vil
+        have i en ``PartyReference``.
+        """
+        url = links(party).get("down", "")
+        if not url:
+            return []
+        r = self.call("GET", url, headers={"Accept": "*/*"})
+        rod = ET.fromstring(r.content)
+        ud = []
+        for p in rod.iter():
+            if p.tag.split("}")[-1] != "Party":
+                continue
+            ud.append({
+                "name": text(p, "Name"),
+                "type": text(p, "Type"),
+                "party_no": text(p, "PartyNumber"),
+                "id": text(p, "Id"),
+                "synch_key": text(p, "SynchronizationKey"),
+                "self": links(p).get("self", ""),
+            })
+        return ud
+
+    def unit_tree(self, root_party_no, max_depth: int = 6) -> list:
+        """Alle ENHEDER under denne rod, med sti og forælder.
+
+        Går træet igennem bredde-først. Mennesker springes over (``Type`` er
+        ``User``), og roden selv kommer med som første post.
+
+        ``max_depth`` er en spærre og ikke en indstilling: en cyklus i
+        organisationen ville ellers køre robotten i ring for evigt. Det samme
+        gør ``set()`` over besøgte numre.
+        """
+        rod = self.party_by_number(root_party_no)
+        if rod is None:
+            return []
+        rod_navn = text(rod, "Name")
+        ud = [{"party_no": str(root_party_no), "name": rod_navn,
+               "parent_party_no": "", "path": rod_navn,
+               "synch_key": text(rod, "SynchronizationKey")}]
+        besoegt = {str(root_party_no)}
+        lag = [(rod, str(root_party_no), rod_navn)]
+        for _dybde in range(max_depth):
+            naeste = []
+            for node, forael_nr, sti in lag:
+                for barn in self.sub_parties(node):
+                    if barn["type"] != "Unit" or not barn["party_no"]:
+                        continue
+                    if barn["party_no"] in besoegt:
+                        continue
+                    besoegt.add(barn["party_no"])
+                    barn_sti = f"{sti} / {barn['name']}" if sti else barn["name"]
+                    ud.append({"party_no": barn["party_no"],
+                               "name": barn["name"],
+                               "parent_party_no": forael_nr,
+                               "path": barn_sti[:1000],
+                               "synch_key": barn["synch_key"]})
+                    if barn["self"]:
+                        naeste.append((self.get(barn["self"]),
+                                       barn["party_no"], barn_sti))
+            if not naeste:
+                break
+            lag = naeste
+        return ud
 
     @staticmethod
     def locked(matter) -> bool:
