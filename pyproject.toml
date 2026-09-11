@@ -17,41 +17,54 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
 ]
+# HVER VERSION ER LAAST, OG DET ER EN SIKKERHEDSREGEL - IKKE PEDANTERI.
+# oomtm installeres fra git ved HVER robotkoersel. Med ">=" ville robotmaskinen
+# hente den nyeste udgave paa PyPI i samme oejeblik, den koerer - saa en kapret
+# pakke rammer maskinen, uden at nogen har besluttet noget. Et "==" betyder, at
+# en ny version er en beslutning, nogen traeffer.
+#
+# Bemaerk: cryptography pinnes ogsaa af OpenOrchestrator (==45.0.*). 45.0.7
+# opfylder begge. Naar OO en dag flytter til 46.x, FEJLER installationen her,
+# indtil nogen retter linjen - det er med vilje. En haard fejl er bedre end en
+# tavs opgradering.
 dependencies = [
-    "requests >= 2.31",
-    "requests-ntlm >= 1.3",
-    "Office365-REST-Python-Client >= 2.5",
-    "certifi >= 2024.2",
-    "cryptography >= 42.0",
-    "pytz >= 2024.1",
+    "requests == 2.34.2",
+    "requests-ntlm == 1.3.0",
+    "Office365-REST-Python-Client == 2.6.2",
+    "certifi == 2026.5.20",
+    "cryptography == 45.0.7",
+    "pytz == 2026.2",
     # Routes TLS verification through the OS trust store (Windows SChannel), so
     # downloads work behind a corporate TLS-inspection proxy where Python's
     # bundled CAs fail. Used by oomtm.pdf's LibreOffice/Tesseract auto-install.
-    "truststore >= 0.9",
+    "truststore == 0.10.4",
 ]
 
 [project.optional-dependencies]
 # PDF conversion paths (oomtm.pdf). Office conversion also needs LibreOffice
 # installed on the machine (not a pip dependency).
 pdf = [
-    "Pillow >= 10.0",
-    "extract-msg >= 0.48",
+    # 10.4.0 fordi robotmaskinerne koerer den - ikke fordi den er nyest.
+    "Pillow == 10.4.0",
+    "extract-msg == 0.55.0",
     # Drives the locally-installed Microsoft Office (Word/Excel/PowerPoint) via
     # COM for high-fidelity PDF export; Windows only. Falls back to LibreOffice
     # when Office or pywin32 is absent.
-    "pywin32 >= 306; sys_platform == 'win32'",
+    "pywin32 == 312; sys_platform == 'win32'",
 ]
 # Aktliste / sagsliste renderers (oomtm.reports): Excel + PDF.
 reports = [
-    "openpyxl >= 3.1",
-    "reportlab >= 4.0",
+    "openpyxl == 3.1.5",
+    "reportlab == 5.0.0",
 ]
+# dev installeres aldrig af en robot - kun paa en udviklermaskine. Derfor staar
+# de tre vaerktoejer frit. openpyxl/reportlab gentages IKKE her; de arves fra
+# [reports], saa versionen kun besluttes ét sted.
 dev = [
+    "oomtm[reports]",
     "pylint",
     "flake8",
     "pytest",
-    "openpyxl >= 3.1",
-    "reportlab >= 4.0",
 ]
 
 [tool.setuptools.packages.find]
