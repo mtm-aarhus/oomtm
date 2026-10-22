@@ -31,7 +31,7 @@ dependencies = [
     "requests == 2.34.2",
     "requests-ntlm == 1.3.0",
     "Office365-REST-Python-Client == 2.6.2",
-    "certifi == 2026.5.20",
+    "certifi == 2026.10.19",
     "cryptography == 45.0.7",
     "pytz == 2026.2",
     # Routes TLS verification through the OS trust store (Windows SChannel), so
