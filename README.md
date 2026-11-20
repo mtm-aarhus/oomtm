@@ -45,6 +45,18 @@ Windows robot users do not need admin rights for the LibreOffice/Tesseract boots
 
 Existing installs still win when `LIBREOFFICE_PATH` or `TESSERACT_PATH` points at a binary.
 
+## Tests
+
+Tests live in `tests/`, and each file runs as a plain script (and under pytest). Use a venv in `tests/.venv` (git-ignored) with the **same Pillow version as the robots** (`Pillow == 10.4.0`, see the `pdf` extra), so a test proves what the robots will do:
+
+```
+python -m venv tests/.venv
+tests/.venv/Scripts/python.exe -m pip install "Pillow==10.4.0"
+tests/.venv/Scripts/python.exe tests/test_pdf_images.py
+```
+
+- `tests/test_pdf_images.py`: `image_to_pdf` makes one page per image, and one page per page of a multi-page TIFF (a scanned letter). Before 2026-11-17 it kept only the first page.
+
 ## Usage examples
 
 ### SharePoint upload

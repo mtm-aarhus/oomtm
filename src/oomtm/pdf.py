@@ -5,7 +5,7 @@ processes):
 
 * already PDF            → passthrough
 * office / text / html   → LibreOffice headless
-* images                 → Pillow (wrapped into a single-page PDF)
+* images                 → Pillow (one page; a multi-page TIFF gets every page)
 * .msg / .eml            → parsed to HTML, then LibreOffice
 * video / audio / unknown→ skipped (caller marks "kan ikke konverteres")
 
@@ -995,8 +995,46 @@ def msoffice_to_pdf(src: str | Path, out_path: str | Path, *, log=None) -> Path 
 # ---------------------------------------------------------------------------
 
 
+# Frame modes Pillow's PDF writer stores as they are (bilevel, grey, palette,
+# colour, CMYK). Anything else - alpha, 16-bit grey, float - is flattened to RGB
+# first. Keeping a bilevel scan bilevel matters: measured on a 3-page A4 scan at
+# 300 dpi, the PDF was 7 KB as it is and 534 KB flattened to RGB, because Pillow
+# stores RGB pages as JPEG - which also blurs the text.
+_PDF_SAFE_MODES = {"1", "L", "P", "RGB", "CMYK"}
+
+
+def _flatten_rgb(im):
+    """One frame as RGB. PDF can't store alpha, so transparency goes onto white."""
+    from PIL import Image
+    if im.mode in ("RGBA", "LA", "P", "PA"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    return im.convert("RGB") if im.mode != "RGB" else im
+
+
 def image_to_pdf(src: str | Path, out_path: str | Path) -> Path | None:
-    """Wrap a raster image into a single-page PDF using Pillow."""
+    """Wrap a raster image into a PDF using Pillow - one page per image, and one
+    page per PAGE of a multi-page TIFF.
+
+    MULTI-PAGE TIFF
+        A scanned letter is often one TIFF with a page per frame. ``Image.open``
+        only gives the first frame, and saving that without ``save_all`` used to
+        produce a one-page PDF - the rest of the letter was silently dropped, and
+        in an aktindsigt the applicant would get part of a document with nothing
+        saying so. Now every frame becomes a page.
+
+        Only TIFF. Other multi-frame formats are not pages: an animated GIF/WebP/
+        PNG is an animation, and an MPO from a camera is a photo plus previews.
+        Those keep the first frame, as before.
+
+        When every frame is in a mode PDF can hold as it is (the usual case: a
+        bilevel or grey scan), Pillow writes the frames straight from the open
+        file - no converted copy of every page is kept, and the pages stay
+        bilevel (see _PDF_SAFE_MODES). Only a TIFF with frames in another mode
+        (alpha, 16-bit) is flattened to RGB, page by page, into memory first.
+    """
     try:
         from PIL import Image  # lazy
     except ImportError:
@@ -1010,16 +1048,28 @@ def image_to_pdf(src: str | Path, out_path: str | Path) -> Path | None:
     out_path = Path(out_path)
     try:
         with Image.open(src) as im:
-            # PDF can't store alpha; flatten onto white.
-            if im.mode in ("RGBA", "LA", "P"):
-                im = im.convert("RGBA")
-                from PIL import Image as _Image
-                bg = _Image.new("RGB", im.size, (255, 255, 255))
-                bg.paste(im, mask=im.split()[-1] if im.mode == "RGBA" else None)
-                im = bg
-            elif im.mode != "RGB":
-                im = im.convert("RGB")
-            im.save(out_path, "PDF", resolution=150.0)
+            frames = getattr(im, "n_frames", 1) or 1
+            if frames > 1 and (im.format or "").upper() == "TIFF":
+                as_is = True
+                for i in range(frames):
+                    im.seek(i)          # reads the frame's header, not its pixels
+                    # A palette with a transparent colour would lose it - flatten.
+                    if im.mode not in _PDF_SAFE_MODES or (
+                            im.mode == "P" and "transparency" in im.info):
+                        as_is = False
+                        break
+                im.seek(0)
+                if as_is:
+                    im.save(out_path, "PDF", resolution=150.0, save_all=True)
+                else:
+                    pages = []
+                    for i in range(frames):
+                        im.seek(i)
+                        pages.append(_flatten_rgb(im.copy()))
+                    pages[0].save(out_path, "PDF", resolution=150.0,
+                                  save_all=True, append_images=pages[1:])
+            else:
+                _flatten_rgb(im).save(out_path, "PDF", resolution=150.0)
     except Exception:  # pylint: disable=broad-except
         return None
     return out_path if out_path.exists() and out_path.stat().st_size > 0 else None
