@@ -1,13 +1,16 @@
-"""PDF conversion helpers for MTM OO processes.
+"""PDF helpers for MTM OO processes: installing LibreOffice and Tesseract
+without admin, verified downloads, images to PDF - and the old entry points
+``convert_to_pdf``/``office_to_pdf``.
 
-Strategy (OCR + redaction live elsewhere — added with the screening / Klargør
-processes):
+Converting a file to PDF is ``oomtm.convert`` (one way for every robot; see
+its docstring). ``convert_to_pdf`` here now calls it, so old callers get the
+same PDFs:
 
-* already PDF            → passthrough
-* office / text / html   → LibreOffice headless
-* images                 → Pillow (one page; a multi-page TIFF gets every page)
-* .msg / .eml            → parsed to HTML, then LibreOffice
-* video / audio / unknown→ skipped (caller marks "kan ikke konverteres")
+* already PDF                 → passthrough
+* .msg / .eml / html / text   → oomtm.mail + WeasyPrint (oomtm.engines)
+* office                      → LibreOffice headless (oomtm.engines)
+* images                      → Pillow (one page; a multi-page TIFF gets every page)
+* video / audio / unknown     → skipped (caller marks "kan ikke konverteres")
 
 LibreOffice must be reachable on the worker. ``ensure_libreoffice`` will, if it
 is missing, auto-install it — and on Windows it does so **without admin** by
@@ -35,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -43,20 +47,21 @@ from pathlib import Path
 # Extension classification
 # ---------------------------------------------------------------------------
 
-PDF_EXTS = {"pdf"}
+# The old names, kept for robots that use them. The lists themselves live in
+# oomtm.convert; "office" here means everything else that can become a PDF
+# (Office, html, text, csv).
+from oomtm.convert import (  # noqa: E402  pylint: disable=wrong-import-position
+    HTML_EXTS as _HTML, IMAGE_EXTS as _IMAGE, MAIL_EXTS as _MAIL, OFFICE_EXTS as _OFFICE,
+    PDF_EXTS as _PDF, TABLE_EXTS as _TABLE, TEXT_EXTS as _TEXT,
+)
 
-IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "ico"}
+PDF_EXTS = set(_PDF)
 
-EMAIL_EXTS = {"msg", "eml"}
+IMAGE_EXTS = set(_IMAGE)
 
-# Formats LibreOffice handles well.
-OFFICE_EXTS = {
-    "doc", "docx", "docm", "dot", "dotx", "odt", "fodt", "rtf", "txt",
-    "csv", "tsv",
-    "xls", "xlsx", "xlsm", "xlsb", "xltx", "ods", "fods",
-    "ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp", "fodp",
-    "htm", "html", "xml", "vsd", "vsdx", "pub",
-}
+EMAIL_EXTS = set(_MAIL)
+
+OFFICE_EXTS = set(_OFFICE | _HTML | _TEXT | _TABLE)
 
 # Things we won't try to convert. Caller marks these "kan ikke konverteres".
 SKIP_EXTS = {
@@ -129,24 +134,34 @@ _DEFAULT_SOFFICE_PATHS = [
 ]
 
 
-def find_soffice(soffice_path: str | None = None) -> str:
+def find_pinned_soffice() -> str | None:
+    """oomtm's own extract of the pinned LIBREOFFICE_VERSION, or None."""
+    return _find_soffice_in(_PINNED_DIR)
+
+
+def find_soffice(soffice_path: str | None = None, *, pinned_only: bool = False) -> str:
     """Locate the LibreOffice binary. Order: explicit arg, LIBREOFFICE_PATH env,
-    PATH lookup, then the usual install locations. Raises if not found."""
+    oomtm's own pinned extract, then (unless ``pinned_only``) PATH, an older
+    unversioned oomtm extract and the usual install locations. Raises if not found.
+
+    The pinned extract comes before PATH and Program Files on purpose: the same
+    version everywhere is what makes the PDFs the same on every robot.
+    """
     candidates = []
     if soffice_path:
         candidates.append(soffice_path)
     env = os.getenv("LIBREOFFICE_PATH")
     if env:
         candidates.append(env)
-    for name in ("soffice", "libreoffice"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(found)
-    # A previous no-admin extract (msiexec /a) drops soffice.exe here.
-    noadmin = _find_soffice_in(_NOADMIN_DIR)
-    if noadmin:
-        candidates.append(noadmin)
-    candidates.extend(_DEFAULT_SOFFICE_PATHS)
+    candidates.append(find_pinned_soffice())
+    if not pinned_only:
+        for name in ("soffice", "libreoffice"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+        # An older, unversioned no-admin extract (before LIBREOFFICE_VERSION).
+        candidates.append(_find_soffice_in(_NOADMIN_DIR))
+        candidates.extend(_DEFAULT_SOFFICE_PATHS)
     for c in candidates:
         p = Path(c) if c else None
         if p and p.exists():
@@ -160,20 +175,41 @@ def find_soffice(soffice_path: str | None = None) -> str:
 _INSTALL_LOCK = Path(tempfile.gettempdir()) / "oomtm_libreoffice_install.lock"
 _MSIEXEC_LOCK = Path(tempfile.gettempdir()) / "oomtm_msiexec.lock"
 
-# Pinned stable build for the no-admin extract. Override with LIBREOFFICE_MSI_URL
-# (e.g. an internal mirror) if this version is retired or the worker has no
-# direct internet access.
+# The ONE LibreOffice version every robot converts with - pinned, so a document
+# comes out the same whichever machine takes it. Bump it on purpose and run the
+# tests (tests/test_konvertering.py).
+#
+# FROM THE ARCHIVE, NOT /stable/. The old pin pointed at
+# download.documentfoundation.org/libreoffice/stable/26.2.4/..., and /stable/
+# only keeps the CURRENT releases: when 26.2.5 came out, 26.2.4 left /stable/ and
+# every new robot machine got a 404 (found 2026-11-20). The archive keeps every
+# build for good.
+#
+# OUR OWN COPY FIRST. The same file is a release asset in mtm-aarhus/oomtm_setup
+# (see its README for how to add a version), so an install never depends on an
+# address we don't control. The archive is the fallback. Either way the file
+# must match LIBREOFFICE_SHA256, or it is thrown away. LIBREOFFICE_MSI_URL
+# replaces both (e.g. an internal mirror) - the hash is still checked.
+LIBREOFFICE_VERSION = "26.2.7.3"
+LIBREOFFICE_SHA256 = "480fecf759fc6393bd614fbf43753eb95a8198fc1a065d41b727e3b664cd1e59"
+_LO_MSI_NAME = f"LibreOffice_{LIBREOFFICE_VERSION}_Win_x86-64.msi"
+SETUP_MIRROR = "https://github.com/mtm-aarhus/oomtm_setup/releases/download"
+_LO_MIRROR_URL = f"{SETUP_MIRROR}/libreoffice-{LIBREOFFICE_VERSION}/{_LO_MSI_NAME}"
 _DEFAULT_LO_MSI_URL = (
-    "https://download.documentfoundation.org/libreoffice/stable/"
-    "26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
+    "https://downloadarchive.documentfoundation.org/libreoffice/old/"
+    f"{LIBREOFFICE_VERSION}/win/x86_64/{_LO_MSI_NAME}"
 )
 
 # Where a no-admin extract lands. LOCALAPPDATA is user-writable (no admin).
-# Override with OOMTM_LIBREOFFICE_DIR if needed.
+# Override with OOMTM_LIBREOFFICE_DIR if needed. Each version gets its own
+# folder (``_NOADMIN_DIR / LIBREOFFICE_VERSION``), so a version bump installs the
+# new one beside the old instead of mixing them - and an older robot on the same
+# machine, still pinned to an older oomtm, keeps the one it uses.
 _NOADMIN_DIR = Path(
     os.getenv("OOMTM_LIBREOFFICE_DIR")
     or (Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "oomtm" / "libreoffice")
 )
+_PINNED_DIR = _NOADMIN_DIR / LIBREOFFICE_VERSION
 
 
 def _find_soffice_in(dir_: Path) -> str | None:
@@ -229,6 +265,14 @@ def _download(url: str, dest: Path, log, timeout: int, attempts: int = 3) -> Non
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, open(dest, "wb") as fh:
                 shutil.copyfileobj(resp, fh, length=1 << 20)
             return
+        except urllib.error.HTTPError as exc:
+            # 404/410: the file isn't there, and asking again won't change that.
+            if exc.code in (404, 410):
+                raise
+            last_exc = exc
+            if attempt < attempts:
+                log(f"Download forsøg {attempt}/{attempts} fejlede ({exc}); prøver igen…")
+                time.sleep(2 * attempt)
         except OSError as exc:  # URLError / SSLError / timeout
             last_exc = exc
             if attempt < attempts:
@@ -245,6 +289,43 @@ def _download(url: str, dest: Path, log, timeout: int, attempts: int = 3) -> Non
             shutil.copyfileobj(resp, fh, length=1 << 20)
         return
     raise last_exc
+
+
+def download_verified(urls: list[str], dest: Path, log, timeout: int,
+                      sha256: str = "", magic: bytes = b"") -> str:
+    """Hent den første adresse i ``urls``, der giver den rigtige fil, til ``dest``.
+
+    Rigtig = begynder med ``magic`` (hvis givet) og har ``sha256`` (hvis givet).
+    En adresse, der svarer 404, eller hvis fil ikke passer, springes over, og
+    den næste prøves. Returnerer den adresse, der blev brugt. Rejser
+    RuntimeError med hver adresses grund, hvis ingen gav den rigtige fil.
+    """
+    grunde = []
+    for url in urls:
+        try:
+            _download(url, dest, log, timeout=timeout)
+        except Exception as exc:  # pylint: disable=broad-except
+            grunde.append(f"{url}: {exc}")
+            dest.unlink(missing_ok=True)
+            continue
+        with open(dest, "rb") as fh:
+            head = fh.read(len(magic)) if magic else b""
+        if magic and head != magic:
+            grunde.append(f"{url}: ikke den forventede filtype ({dest.stat().st_size} byte)")
+            dest.unlink(missing_ok=True)
+            continue
+        if sha256:
+            faktisk = hashlib.sha256()
+            with open(dest, "rb") as fh:
+                for blok in iter(lambda: fh.read(1 << 20), b""):
+                    faktisk.update(blok)
+            if faktisk.hexdigest().lower() != sha256.lower():
+                grunde.append(f"{url}: SHA-256 passer ikke ({faktisk.hexdigest()})")
+                dest.unlink(missing_ok=True)
+                continue
+        log(f"Hentet og kontrolleret: {url}")
+        return url
+    raise RuntimeError("Kunne ikke hente en kontrolleret fil. " + " | ".join(grunde))
 
 
 def _tail_text(path: Path, max_chars: int = 2000) -> str:
@@ -356,38 +437,36 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
     ``soffice.exe`` works fine for headless conversion. Override the source MSI
     with the ``LIBREOFFICE_MSI_URL`` env var.
     """
-    url = os.getenv("LIBREOFFICE_MSI_URL", _DEFAULT_LO_MSI_URL)
-    target = _NOADMIN_DIR
-    target.mkdir(parents=True, exist_ok=True)
+    override = os.getenv("LIBREOFFICE_MSI_URL")
+    urls = [override] if override else [_LO_MIRROR_URL, _DEFAULT_LO_MSI_URL]
+    target = _PINNED_DIR
+    _NOADMIN_DIR.mkdir(parents=True, exist_ok=True)
+    # Unpack into a scratch folder and rename it into place only when it is
+    # complete: an interrupted msiexec can leave soffice.exe without its DLLs,
+    # and a half extract that LOOKS installed would be found on every later run.
+    work = _NOADMIN_DIR / f".udpakker-{LIBREOFFICE_VERSION}-{uuid.uuid4().hex[:8]}"
     # The source MSI must live OUTSIDE the extraction target: msiexec /a fails
-    # with 1603 when TARGETDIR is the folder that holds the source package. Also
-    # clear a stray MSI left inside the target by an earlier failed run.
-    (target / "libreoffice.msi").unlink(missing_ok=True)
-    msi = target.parent / "libreoffice-download.msi"
-    log_path = target.parent / "libreoffice-msi-install.log"
-    _download(url, msi, log, timeout=min(timeout, 1200))
+    # with 1603 when TARGETDIR is the folder that holds the source package.
+    msi = _NOADMIN_DIR / "libreoffice-download.msi"
+    log_path = _NOADMIN_DIR / "libreoffice-msi-install.log"
+    # An MSI is an OLE file: a mirror's "choose a download" page or an error
+    # page served as 200 is rejected by the magic bytes, a wrong file by the hash.
+    download_verified(urls, msi, log, timeout=min(timeout, 1200),
+                      sha256=LIBREOFFICE_SHA256, magic=_MSI_MAGIC)
 
-    head = b""
+    log(f"LibreOffice {LIBREOFFICE_VERSION}: udpakker (msiexec /a - ingen admin)…")
     try:
-        with open(msi, "rb") as fh:
-            head = fh.read(8)
-    except OSError:
-        pass
-    if head != _MSI_MAGIC:
-        size = msi.stat().st_size if msi.exists() else 0
+        work.mkdir(parents=True, exist_ok=True)
+        _run_msiexec_admin_extract(msi, work, log_path, log, timeout, "LibreOffice")
+        if not _find_soffice_in(work):
+            raise RuntimeError(
+                f"LibreOffice udpakket til {work}, men soffice.exe blev ikke fundet."
+            )
+        shutil.rmtree(target, ignore_errors=True)
+        work.replace(target)
+    finally:
         msi.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"hentet fil er ikke en gyldig MSI (størrelse {size} bytes). "
-            f"Tjek LIBREOFFICE_MSI_URL: {url}"
-        )
-
-    log("LibreOffice: udpakker (msiexec /a — ingen admin)…")
-    _run_msiexec_admin_extract(msi, target, log_path, log, timeout, "LibreOffice")
-    msi.unlink(missing_ok=True)
-    if not _find_soffice_in(target):
-        raise RuntimeError(
-            f"LibreOffice udpakket til {target}, men soffice.exe blev ikke fundet."
-        )
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _run_installer(cmd: list[str], log, timeout: int) -> None:
@@ -437,29 +516,51 @@ def ensure_libreoffice(
     install_timeout: int = 1800,
     wait_timeout: int = 1800,
 ) -> str:
-    """Return a usable soffice path, installing LibreOffice first if missing.
+    """Return a usable soffice path - the PINNED LIBREOFFICE_VERSION, unpacked
+    without admin rights if it isn't there yet.
+
+    An explicit ``soffice_path`` or LIBREOFFICE_PATH wins. Otherwise the pinned
+    version is used and installed when missing, even if some other LibreOffice
+    is on the machine: the same version on every robot is what makes the PDFs
+    the same. Only if that install fails is another LibreOffice used (with a
+    log line saying so), rather than not converting at all.
 
     Safe to call from many parallel workers: installation is guarded by a
     lock file so only one worker installs while the others wait and then pick
-    up the freshly-installed binary. A no-op (just ``find_soffice``) once
-    LibreOffice is present, so it's cheap to call on every job.
+    up the freshly-installed binary. A no-op once the pinned version is there,
+    so it's cheap to call on every job.
 
-    Raises ``RuntimeError`` if LibreOffice is absent and can't be installed.
+    Raises ``RuntimeError`` if no LibreOffice can be found or installed.
     """
     log = log or (lambda *_: None)
-    try:
+    if soffice_path or os.getenv("LIBREOFFICE_PATH"):
         return find_soffice(soffice_path)
-    except RuntimeError:
-        if not install:
-            raise
+    if find_pinned_soffice():
+        return find_soffice()
+    if not install:
+        return find_soffice()
 
+    try:
+        return _install_pinned_libreoffice(log, install_timeout, wait_timeout)
+    except RuntimeError as exc:
+        try:
+            other = find_soffice()
+        except RuntimeError:
+            raise exc from None
+        log(f"LibreOffice {LIBREOFFICE_VERSION} kunne ikke installeres ({exc}). "
+            f"Bruger {other} i stedet - PDF'erne kan se lidt anderledes ud end på "
+            "de andre robotter.")
+        return other
+
+
+def _install_pinned_libreoffice(log, install_timeout: int, wait_timeout: int) -> str:
+    """Install the pinned version under the shared lock; return its soffice."""
     deadline = time.monotonic() + wait_timeout
     while time.monotonic() < deadline:
         # Re-check first — another worker may have just finished installing.
-        try:
-            return find_soffice(soffice_path)
-        except RuntimeError:
-            pass
+        found = find_pinned_soffice()
+        if found:
+            return find_soffice()
         try:
             fd = os.open(str(_INSTALL_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode())
@@ -476,7 +577,7 @@ def ensure_libreoffice(
 
         # We hold the lock — do the install.
         try:
-            log("LibreOffice ikke fundet — installerer…")
+            log(f"LibreOffice {LIBREOFFICE_VERSION} ikke fundet - installerer…")
             try:
                 _install_libreoffice(log, install_timeout)
             except subprocess.CalledProcessError as exc:
@@ -486,14 +587,16 @@ def ensure_libreoffice(
                 ) from exc
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("LibreOffice-installation timede ud.") from exc
-            path = find_soffice(soffice_path)
+            if not find_pinned_soffice() and sys.platform.startswith("win"):
+                raise RuntimeError("LibreOffice blev pakket ud, men findes ikke bagefter.")
+            path = find_soffice()
             log(f"LibreOffice installeret: {path}")
             return path
         finally:
             _INSTALL_LOCK.unlink(missing_ok=True)
 
-    # Timed out waiting for someone else's install — last try.
-    return find_soffice(soffice_path)
+    raise RuntimeError(f"Ventede for længe på, at en anden installerede LibreOffice "
+                       f"{LIBREOFFICE_VERSION}.")
 
 
 # ---------------------------------------------------------------------------
@@ -785,211 +888,6 @@ def ensure_tesseract(
     return _finish(find_tesseract(tesseract_path))
 
 
-def office_to_pdf(
-    src: str | Path,
-    out_dir: str | Path,
-    *,
-    soffice_path: str | None = None,
-    timeout: int = 240,
-) -> Path | None:
-    """Convert an office/text/html file to PDF via LibreOffice headless.
-
-    Returns the path to the produced PDF, or None if LibreOffice produced no
-    output. Uses a throwaway user-profile dir per call so multiple conversions
-    can run in parallel without clobbering each other's profile lock.
-    """
-    soffice = find_soffice(soffice_path)
-    src = Path(src)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    profile = Path(tempfile.gettempdir()) / f"lo_profile_{uuid.uuid4().hex}"
-    try:
-        cmd = [
-            soffice,
-            "--headless", "--norestore", "--nolockcheck", "--nodefault",
-            f"-env:UserInstallation=file:///{profile.as_posix()}",
-            "--convert-to", "pdf",
-            "--outdir", str(out_dir),
-            str(src),
-        ]
-        subprocess.run(
-            cmd, check=True, timeout=timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    finally:
-        shutil.rmtree(profile, ignore_errors=True)
-
-    produced = out_dir / (src.stem + ".pdf")
-    return produced if produced.exists() and produced.stat().st_size > 0 else None
-
-
-# ---------------------------------------------------------------------------
-# Microsoft Office (COM automation) — higher fidelity than LibreOffice for
-# Word/Excel/PowerPoint. Windows + installed Office + pywin32 only. Used in
-# preference to LibreOffice when available; LibreOffice remains the fallback.
-#
-# NB: these documents come from external citizens, so macros are force-disabled
-# (AutomationSecurity = msoAutomationSecurityForceDisable = 3) before opening.
-# COM automation expects a usable session — fine for an interactive/unattended
-# RPA login, less so for a bare service account.
-# ---------------------------------------------------------------------------
-
-_MSOFFICE_APP = {}
-for _e in ("doc", "docx", "docm", "dot", "dotx"):
-    _MSOFFICE_APP[_e] = "word"
-# for _e in ("xls", "xlsx", "xlsm", "xlsb", "xltx"):
-#     _MSOFFICE_APP[_e] = "excel"
-for _e in ("ppt", "pptx", "pps", "ppsx", "pot", "potx"):
-    _MSOFFICE_APP[_e] = "powerpoint"
-
-_MSO_SECURITY_FORCE_DISABLE = 3  # msoAutomationSecurityForceDisable
-_WD_EXPORT_PDF = 17              # wdExportFormatPDF
-_XL_TYPE_PDF = 0                 # xlTypePDF
-_PP_SAVE_AS_PDF = 32             # ppSaveAsPDF
-
-
-def _word_to_pdf(src_abs: str, out_abs: str) -> bool:
-    import win32com.client as win32
-    word = doc = None
-    try:
-        word = win32.DispatchEx("Word.Application")
-        word.Visible = False
-        for setter in (lambda: setattr(word, "DisplayAlerts", 0),
-                       lambda: setattr(word, "AutomationSecurity", _MSO_SECURITY_FORCE_DISABLE)):
-            try:
-                setter()
-            except Exception:  # pylint: disable=broad-except
-                pass
-        doc = word.Documents.Open(src_abs, ReadOnly=True, ConfirmConversions=False, AddToRecentFiles=False)
-        doc.ExportAsFixedFormat(out_abs, _WD_EXPORT_PDF)
-        return True
-    finally:
-        try:
-            if doc is not None:
-                doc.Close(False)
-        except Exception:  # pylint: disable=broad-except
-            pass
-        try:
-            if word is not None:
-                word.Quit()
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-
-def _excel_to_pdf(src_abs: str, out_abs: str) -> bool:
-    import win32com.client as win32
-    excel = wb = None
-    try:
-        excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = False
-        for setter in (lambda: setattr(excel, "DisplayAlerts", False),
-                       lambda: setattr(excel, "AutomationSecurity", _MSO_SECURITY_FORCE_DISABLE)):
-            try:
-                setter()
-            except Exception:  # pylint: disable=broad-except
-                pass
-        wb = excel.Workbooks.Open(src_abs, ReadOnly=True, UpdateLinks=0)
-        wb.ExportAsFixedFormat(_XL_TYPE_PDF, out_abs)
-        return True
-    finally:
-        try:
-            if wb is not None:
-                wb.Close(False)
-        except Exception:  # pylint: disable=broad-except
-            pass
-        try:
-            if excel is not None:
-                excel.Quit()
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-
-def _ppt_to_pdf(src_abs: str, out_abs: str) -> bool:
-    import win32com.client as win32
-    ppt = pres = None
-    try:
-        ppt = win32.DispatchEx("PowerPoint.Application")
-        # PowerPoint refuses Visible=False; open the file windowless instead.
-        try:
-            ppt.AutomationSecurity = _MSO_SECURITY_FORCE_DISABLE
-        except Exception:  # pylint: disable=broad-except
-            pass
-        pres = ppt.Presentations.Open(src_abs, WithWindow=False, ReadOnly=True)
-        pres.SaveAs(out_abs, _PP_SAVE_AS_PDF)
-        return True
-    finally:
-        try:
-            if pres is not None:
-                pres.Close()
-        except Exception:  # pylint: disable=broad-except
-            pass
-        try:
-            if ppt is not None:
-                ppt.Quit()
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-
-def msoffice_available(ext: str) -> bool:
-    """Whether MS Office COM conversion is plausible for this extension here
-    (Windows + pywin32 importable + a known Office app for the extension).
-    Doesn't actually launch Office — failures still fall back at convert time."""
-    if not sys.platform.startswith("win"):
-        return False
-    if _MSOFFICE_APP.get((ext or "").lower().lstrip(".")) is None:
-        return False
-    try:
-        import win32com.client  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def msoffice_to_pdf(src: str | Path, out_path: str | Path, *, log=None) -> Path | None:
-    """Convert a Word/Excel/PowerPoint file to PDF via the installed Office.
-    Returns the PDF path, or None if Office isn't usable / the conversion failed
-    (so the caller can fall back to LibreOffice)."""
-    log = log or (lambda *_: None)
-    ext = Path(src).suffix.lower().lstrip(".")
-    app = _MSOFFICE_APP.get(ext)
-    if not app or not sys.platform.startswith("win"):
-        return None
-    try:
-        import pythoncom
-    except ImportError:
-        return None
-
-    out_path = Path(out_path)
-    src_abs = str(Path(src).resolve())
-    out_abs = str(out_path.resolve())
-    if out_path.exists():
-        out_path.unlink()
-
-    pythoncom.CoInitialize()
-    try:
-        if app == "word":
-            ok = _word_to_pdf(src_abs, out_abs)
-        elif app == "excel":
-            ok = _excel_to_pdf(src_abs, out_abs)
-        else:
-            ok = _ppt_to_pdf(src_abs, out_abs)
-    except Exception as exc:  # pylint: disable=broad-except
-        log(f"MS Office-konvertering fejlede ({ext}): {exc}")
-        ok = False
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-    if ok and out_path.exists() and out_path.stat().st_size > 0:
-        return out_path
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
@@ -1076,135 +974,27 @@ def image_to_pdf(src: str | Path, out_path: str | Path) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Email (.msg / .eml) → HTML → PDF
+# Den gamle vej ind - nu den samme motor som oomtm.convert
 # ---------------------------------------------------------------------------
+#
+# Robotter, der stadig kalder convert_to_pdf/office_to_pdf, får nu nøjagtig de
+# samme PDF'er som dem, der bruger oomtm.convert: mails gennem oomtm.mail og
+# WeasyPrint, Office gennem LibreOffice med genbrugte profiler. Word gennem COM
+# (MS Office) er fjernet - den klarede ikke flere robotter ad gangen.
 
 
-def _email_to_html(src: str | Path, ext: str) -> str | None:
-    """Render an email's headers + body to a standalone HTML string.
-
-    Attachments are NOT extracted (out of scope) — they're listed by name in a
-    footer so the reviewer knows they existed.
-    """
-    ext = (ext or "").lower().lstrip(".")
-    headers = {}
-    body_html = None
-    body_text = None
-    attachments: list[str] = []
-
-    if ext == "msg":
-        try:
-            import extract_msg  # lazy
-        except ImportError:
-            return None
-        try:
-            msg = extract_msg.openMsg(str(src))
-            try:
-                headers = {
-                    "Fra": msg.sender or "",
-                    "Til": msg.to or "",
-                    "Cc": msg.cc or "",
-                    "Dato": str(msg.date or ""),
-                    "Emne": msg.subject or "",
-                }
-                body_html = getattr(msg, "htmlBody", None)
-                if isinstance(body_html, bytes):
-                    body_html = body_html.decode("utf-8", errors="replace")
-                body_text = msg.body
-                for att in (msg.attachments or []):
-                    name = (att.longFilename or att.shortFilename or "ukendt").replace("\x00", "").strip()
-                    if name:
-                        attachments.append(name)
-            finally:
-                msg.close()
-        except Exception:  # pylint: disable=broad-except
-            return None
-
-    elif ext == "eml":
-        from email import policy
-        from email.parser import BytesParser
-        try:
-            with open(src, "rb") as fh:
-                m = BytesParser(policy=policy.default).parse(fh)
-            headers = {
-                "Fra": m.get("From", ""),
-                "Til": m.get("To", ""),
-                "Cc": m.get("Cc", ""),
-                "Dato": m.get("Date", ""),
-                "Emne": m.get("Subject", ""),
-            }
-            html_part = m.get_body(preferencelist=("html",))
-            text_part = m.get_body(preferencelist=("plain",))
-            if html_part is not None:
-                body_html = html_part.get_content()
-            if text_part is not None:
-                body_text = text_part.get_content()
-            for part in m.iter_attachments():
-                fn = part.get_filename()
-                if fn:
-                    attachments.append(fn)
-        except Exception:  # pylint: disable=broad-except
-            return None
-    else:
-        return None
-
-    def esc(s: str) -> str:
-        return (str(s or "")
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
-    header_rows = "".join(
-        f"<tr><td style='font-weight:bold;padding-right:10px;vertical-align:top'>{esc(k)}</td>"
-        f"<td>{esc(v)}</td></tr>"
-        for k, v in headers.items() if v
-    )
-    if body_html:
-        body_block = body_html  # already HTML
-    else:
-        body_block = "<pre style='white-space:pre-wrap;font-family:inherit'>" + esc(body_text or "") + "</pre>"
-    att_block = ""
-    if attachments:
-        items = "".join(f"<li>{esc(a)}</li>" for a in attachments)
-        att_block = (
-            "<hr><p style='font-weight:bold'>Vedhæftede filer "
-            "(ikke medtaget i denne PDF):</p><ul>" + items + "</ul>"
-        )
-
-    return f"""<!DOCTYPE html>
-<html lang="da"><head><meta charset="utf-8">
-<style>body{{font-family:Arial,Helvetica,sans-serif;font-size:11pt;color:#000}}
-table{{margin-bottom:14px;border-collapse:collapse}}</style></head>
-<body>
-<table>{header_rows}</table>
-<hr>
-{body_block}
-{att_block}
-</body></html>"""
-
-
-def email_to_pdf(
+def office_to_pdf(
     src: str | Path,
-    ext: str,
     out_dir: str | Path,
     *,
     soffice_path: str | None = None,
     timeout: int = 240,
 ) -> Path | None:
-    html = _email_to_html(src, ext)
-    if html is None:
-        return None
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    html_path = out_dir / f"{Path(src).stem}.html"
-    html_path.write_text(html, encoding="utf-8")
-    try:
-        return office_to_pdf(html_path, out_dir, soffice_path=soffice_path, timeout=timeout)
-    finally:
-        html_path.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
+    """En Office-fil til PDF med LibreOffice headless (oomtm.engines). None,
+    hvis der ikke kom en PDF ud."""
+    from oomtm import engines
+    return engines.libreoffice_to_pdf(src, out_dir, soffice=find_soffice(soffice_path),
+                                      timeout=timeout)
 
 
 def convert_to_pdf(
@@ -1212,83 +1002,29 @@ def convert_to_pdf(
     ext: str,
     out_dir: str | Path,
     *,
-    soffice_path: str | None = None,
+    soffice_path: str | None = None,  # pylint: disable=unused-argument
     auto_install: bool = False,
-    prefer_msoffice: bool | None = None,
+    prefer_msoffice: bool | None = None,  # pylint: disable=unused-argument
     log=None,
 ) -> tuple[Path | None, str, str]:
-    """Convert ``src`` to PDF, choosing the method from ``ext``.
+    """Lav ``src`` om til PDF med ``oomtm.convert`` - filtypen ``ext`` afgør
+    motoren. Brug hellere ``oomtm.convert.convert`` direkte i ny kode: den
+    giver også en mails vedhæftede filer og advarsler.
 
-    Returns ``(pdf_path, status, note)`` where status is one of:
-      * ``"ready"``   — pdf_path points to a usable PDF
-      * ``"skipped"`` — deliberately not converted (video/audio/unknown)
-      * ``"error"``   — conversion was attempted but failed
+    Returnerer ``(pdf, status, note)``, hvor status er
+      * ``"ready"``   - ``pdf`` er en brugbar PDF
+      * ``"skipped"`` - filtypen kan ikke blive en PDF (video, lyd, zip, ...)
+      * ``"error"``   - den kunne, men det lykkedes ikke; ``note`` siger hvorfor
 
-    Office documents are converted with **LibreOffice headless by default** —
-    it's concurrency-safe (each call gets its own profile) and reliable
-    unattended. MS Office (COM automation) gives higher fidelity for Word/
-    PowerPoint but is single-desktop and unsafe to run concurrently, so it is
-    opt-in: pass ``prefer_msoffice=True`` or set ``OOMTM_PREFER_MSOFFICE=1``.
-    The default (``None``) reads that env var and stays off unless it's set.
-
-    When ``auto_install`` is True the LibreOffice path installs LibreOffice on
-    the worker if it's missing (via ``ensure_libreoffice`` — no-admin on
-    Windows). MS Office is never installed automatically.
+    ``soffice_path`` og ``prefer_msoffice`` bruges ikke længere (MS Office er
+    fjernet); de er her, så gamle kald stadig virker.
     """
-    log = log or (lambda *_: None)
-    if prefer_msoffice is None:
-        prefer_msoffice = os.getenv("OOMTM_PREFER_MSOFFICE", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
-    src = Path(src)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    kind = classify(ext)
-
-    if kind == "pdf":
-        return src, "ready", ""
-
-    if kind == "image":
-        out = out_dir / f"{src.stem}.pdf"
-        result = image_to_pdf(src, out)
-        if result:
-            return result, "ready", ""
-        return None, "error", f"Billedet kunne ikke konverteres ({ext})."
-
-    if kind == "skip":
-        return None, "skipped", f"Filtypen {ext} kan ikke konverteres til PDF (gennemse manuelt)."
-
-    # ----- office: MS Office first (best fidelity), LibreOffice fallback -----
-    if kind == "office":
-        if prefer_msoffice and msoffice_available(ext):
-            out = out_dir / f"{src.stem}.pdf"
-            result = msoffice_to_pdf(src, out, log=log)
-            if result:
-                return result, "ready", ""
-            log("MS Office utilgængelig/fejlede — falder tilbage til LibreOffice")
-        try:
-            soffice_path = ensure_libreoffice(soffice_path, install=auto_install, log=log)
-        except RuntimeError as exc:
-            return None, "error", str(exc)
-        result = office_to_pdf(src, out_dir, soffice_path=soffice_path)
-        if result:
-            return result, "ready", ""
-        return None, "error", f"Kunne ikke konvertere filen ({ext})."
-
-    # ----- email / unknown: LibreOffice (Office can't open these well) -------
-    try:
-        soffice_path = ensure_libreoffice(soffice_path, install=auto_install, log=log)
-    except RuntimeError as exc:
-        return None, "error", str(exc)
-
-    if kind == "email":
-        result = email_to_pdf(src, ext, out_dir, soffice_path=soffice_path)
-        if result:
-            return result, "ready", ""
-        return None, "error", f"E-mailen kunne ikke konverteres ({ext})."
-
-    # unknown — LibreOffice as a last resort; it handles many odd formats.
-    result = office_to_pdf(src, out_dir, soffice_path=soffice_path)
-    if result:
-        return result, "ready", ""
-    return None, "skipped", f"Ukendt filtype ({ext}) — kunne ikke konverteres automatisk."
+    from oomtm import convert
+    e = (ext or "").lower().lstrip(".")
+    if not convert.can_convert(e):
+        return None, "skipped", f"Filtypen .{e} kan ikke laves om til PDF." if e else \
+            "En fil uden filtype kan ikke laves om til PDF."
+    r = convert.convert(src, out_dir, name=f"fil.{e}", install=auto_install, log=log)
+    if r.ok:
+        return r.pdf, "ready", ""
+    return None, "error", r.note

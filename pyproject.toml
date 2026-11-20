@@ -41,16 +41,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PDF conversion paths (oomtm.pdf). Office conversion also needs LibreOffice
-# installed on the machine (not a pip dependency).
+# PDF-konvertering (oomtm.convert / oomtm.pdf). LibreOffice og WeasyPrints
+# Windows-biblioteker er ikke pip-pakker: oomtm henter dem selv, uden admin
+# (se oomtm.engines og github.com/mtm-aarhus/oomtm_setup).
 pdf = [
     # 10.4.0 fordi robotmaskinerne koerer den - ikke fordi den er nyest.
     "Pillow == 10.4.0",
     "extract-msg == 0.55.0",
-    # Drives the locally-installed Microsoft Office (Word/Excel/PowerPoint) via
-    # COM for high-fidelity PDF export; Windows only. Falls back to LibreOffice
-    # when Office or pywin32 is absent.
-    "pywin32 == 312; sys_platform == 'win32'",
+    # Mails, HTML, tekst og CSV til PDF. SKAL vaere samme version som
+    # WEASYPRINT_VERSION i src/oomtm/engines.py (bibliotekerne passer til den).
+    "weasyprint == 70.0",
+    # Rensning af mailens HTML (oomtm.mail). extract-msg traekker den ogsaa.
+    "beautifulsoup4 == 4.13.5",
+    # Dansk tid i mailens hoved: Windows har ingen tidszonedata til zoneinfo.
+    "tzdata == 2026.6",
 ]
 # Aktliste / sagsliste renderers (oomtm.reports): Excel + PDF.
 reports = [
@@ -71,4 +75,6 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-oomtm = ["py.typed"]
+# fonts/: Noto Emoji (SIL Open Font License, se fonts/OFL.txt) - WeasyPrint
+# tegner emoji med den.
+oomtm = ["py.typed", "fonts/*"]

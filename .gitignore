@@ -11,3 +11,7 @@ venv/
 *.crt
 *.pem
 *.pfx
+
+# Rigtige testfiler med personoplysninger - aldrig i git
+tests/egne_filer/
+tests/ud/
