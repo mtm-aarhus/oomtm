@@ -198,17 +198,17 @@ def _weasy_libs() -> Path | None:
 
 
 def _download_weasyprint(log, timeout: int) -> None:
-    from oomtm.pdf import download_verified
+    from oomtm.pdf import download_verified, move_into_place, remove_tree
     override = os.getenv("OOMTM_WEASYPRINT_ZIP_URL")
     urls = [override] if override else [_WEASY_MIRROR_URL, _WEASY_ZIP_URL]
     _WEASY_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = _WEASY_DIR / f"weasyprint-{WEASYPRINT_VERSION}-{uuid.uuid4().hex}.zip"
+    # Pak ud i en midlertidig mappe og flyt den på plads til sidst: en
+    # afbrudt udpakning må ikke ligne en færdig installation.
+    tmp = _WEASY_DIR / f".udpakker-{uuid.uuid4().hex}"
     try:
         download_verified(urls, zip_path, log, timeout=min(timeout, 1200),
                           sha256=WEASYPRINT_SHA256, magic=b"PK\x03\x04")
-        # Pak ud i en midlertidig mappe og flyt den på plads til sidst: en
-        # afbrudt udpakning må ikke ligne en færdig installation.
-        tmp = _WEASY_DIR / f".udpakker-{uuid.uuid4().hex}"
         with zipfile.ZipFile(zip_path) as z:
             for info in z.infolist():
                 navn = info.filename.replace("\\", "/")
@@ -226,13 +226,14 @@ def _download_weasyprint(log, timeout: int) -> None:
                 with z.open(info) as src, open(ud, "wb") as dst:
                     shutil.copyfileobj(src, dst, length=1 << 20)
         if not (tmp / _MARK).is_file():
-            shutil.rmtree(tmp, ignore_errors=True)
             raise RuntimeError(f"WeasyPrint-zip'en havde ikke {_MARK}.")
-        target = _WEASY_DIR / WEASYPRINT_VERSION
-        shutil.rmtree(target, ignore_errors=True)
-        tmp.replace(target)
+        # Prøver igen et stykke tid, hvis Windows nægter omdøbningen (fx mens
+        # antivirus scanner de nye filer). Se oomtm.pdf.move_into_place.
+        move_into_place(tmp, _WEASY_DIR / WEASYPRINT_VERSION, log)
     finally:
         zip_path.unlink(missing_ok=True)
+        if tmp.exists():
+            remove_tree(tmp)
 
 
 def _fonts_conf(libs: Path | None) -> Path:

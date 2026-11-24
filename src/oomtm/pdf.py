@@ -34,6 +34,7 @@ import hashlib
 import os
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -135,8 +136,20 @@ _DEFAULT_SOFFICE_PATHS = [
 
 
 def find_pinned_soffice() -> str | None:
-    """oomtm's own extract of the pinned LIBREOFFICE_VERSION, or None."""
-    return _find_soffice_in(_PINNED_DIR)
+    """oomtm's own extract of the pinned LIBREOFFICE_VERSION, or None.
+
+    Normalt ligger den i ``_PINNED_DIR``. Ville Windows ikke omdøbe den færdige
+    udpakning dertil, bruges den, hvor den ligger: så har den filen ``_KLAR``
+    (se ``_extract_libreoffice_no_admin``).
+    """
+    found = _find_soffice_in(_PINNED_DIR)
+    if found:
+        return found
+    for d in _faerdige_udpakninger():
+        found = _find_soffice_in(d)
+        if found:
+            return found
+    return None
 
 
 def find_soffice(soffice_path: str | None = None, *, pinned_only: bool = False) -> str:
@@ -213,13 +226,118 @@ _PINNED_DIR = _NOADMIN_DIR / LIBREOFFICE_VERSION
 
 
 def _find_soffice_in(dir_: Path) -> str | None:
-    """Return the first ``soffice.exe`` found under *dir_*, or None."""
+    """Return the ``soffice.exe`` of a LibreOffice under *dir_*, or None.
+
+    ``program\\soffice.exe`` first - that is where ``msiexec /a`` puts it - then
+    the rest of the tree. Folders starting with a dot (``.udpakker-…``,
+    ``.gammel-…``) are skipped: they hold half extracts. An error on the way (a
+    path over 260 characters, a folder we may not read) does not stop the search.
+    """
+    d = Path(dir_)
     try:
-        for p in Path(dir_).rglob("soffice.exe"):
-            return str(p)
+        direct = d / "program" / "soffice.exe"
+        if direct.is_file():
+            return str(direct)
     except OSError:
         pass
+    for root, dirs, files in os.walk(d):
+        dirs[:] = sorted(x for x in dirs if not x.startswith("."))
+        for name in files:
+            if name.lower() == "soffice.exe":
+                return str(Path(root) / name)
     return None
+
+
+# Lægges i en udpakning, når msiexec er færdig og soffice.exe er fundet. Kun en
+# udpakning med den fil bruges, hvis den ikke kunne flyttes på plads.
+_KLAR = "oomtm-klar.txt"
+
+
+def _faerdige_udpakninger() -> list[Path]:
+    """Færdige udpakninger af LIBREOFFICE_VERSION, der ikke kom på plads. Nyeste først."""
+    try:
+        fundne = [p for p in _NOADMIN_DIR.glob(f".udpakker-{LIBREOFFICE_VERSION}-*")
+                  if (p / _KLAR).is_file()]
+    except OSError:
+        return []
+
+    def _tid(p: Path) -> float:
+        try:
+            return (p / _KLAR).stat().st_mtime
+        except OSError:
+            return 0.0
+    return sorted(fundne, key=_tid, reverse=True)
+
+
+def remove_tree(path: str | Path) -> bool:
+    """Slet en mappe, så godt det kan lade sig gøre. True, hvis den er væk.
+
+    Som ``shutil.rmtree(ignore_errors=True)``, men en skrivebeskyttet fil gøres
+    skrivbar og slettes; det gør rmtree ikke selv på Windows. En fil, et andet
+    program har åben, bliver liggende - det er ikke en fejl her.
+    """
+    p = Path(path)
+
+    def _retry(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(p, onexc=_retry)  # pylint: disable=unexpected-keyword-arg
+        else:
+            shutil.rmtree(p, onerror=_retry)  # pylint: disable=deprecated-argument
+    except OSError:
+        pass
+    return not p.exists()
+
+
+def move_into_place(src: str | Path, dest: str | Path, log=None, wait: float = 120) -> None:
+    """Omdøb den færdige mappe *src* til *dest*; en gammel *dest* skubbes til side.
+
+    Windows svarer "Adgang nægtet" (WinError 5), når en anden proces har en fil
+    i mappen åben - typisk antivirus, der scanner de nye filer lige efter en
+    udpakning - og når *dest* allerede findes. Derfor prøves der igen i op til
+    *wait* sekunder. Den sidste OSError rejses, hvis det aldrig lykkes.
+    """
+    log = log or (lambda *_: None)
+    src, dest = Path(src), Path(dest)
+    deadline = time.monotonic() + wait
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if dest.exists():
+                aside = dest.with_name(f".gammel-{dest.name}-{uuid.uuid4().hex[:8]}")
+                dest.replace(aside)
+                remove_tree(aside)
+            src.replace(dest)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise
+            if attempt == 1:
+                log(f"Kan ikke flytte {src.name} til {dest.name} endnu ({exc}); "
+                    "prøver igen lidt endnu.")
+            time.sleep(min(10.0, 2.0 * attempt, max(0.1, deadline - time.monotonic())))
+
+
+def _ryd_gamle_udpakninger() -> None:
+    """Fjern halve udpakninger og skubbet-til-side mapper fra tidligere kørsler.
+
+    Kaldes med installationslåsen, så ingen anden proces er midt i en udpakning.
+    """
+    try:
+        mapper = [p for p in _NOADMIN_DIR.glob(".*") if p.is_dir()]
+    except OSError:
+        return
+    for p in mapper:
+        halv = (p.name.startswith(f".udpakker-{LIBREOFFICE_VERSION}-")
+                and not (p / _KLAR).is_file())
+        if halv or p.name.startswith(".gammel-"):
+            remove_tree(p)
 
 
 # MSI files are OLE compound documents starting with this signature. A mirror
@@ -441,6 +559,7 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
     urls = [override] if override else [_LO_MIRROR_URL, _DEFAULT_LO_MSI_URL]
     target = _PINNED_DIR
     _NOADMIN_DIR.mkdir(parents=True, exist_ok=True)
+    _ryd_gamle_udpakninger()
     # Unpack into a scratch folder and rename it into place only when it is
     # complete: an interrupted msiexec can leave soffice.exe without its DLLs,
     # and a half extract that LOOKS installed would be found on every later run.
@@ -455,6 +574,7 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
                       sha256=LIBREOFFICE_SHA256, magic=_MSI_MAGIC)
 
     log(f"LibreOffice {LIBREOFFICE_VERSION}: udpakker (msiexec /a - ingen admin)…")
+    complete = False
     try:
         work.mkdir(parents=True, exist_ok=True)
         _run_msiexec_admin_extract(msi, work, log_path, log, timeout, "LibreOffice")
@@ -462,11 +582,22 @@ def _extract_libreoffice_no_admin(log, timeout: int) -> None:
             raise RuntimeError(
                 f"LibreOffice udpakket til {work}, men soffice.exe blev ikke fundet."
             )
-        shutil.rmtree(target, ignore_errors=True)
-        work.replace(target)
+        (work / _KLAR).write_text(
+            f"LibreOffice {LIBREOFFICE_VERSION} er pakket helt ud af oomtm.\n",
+            encoding="utf-8")
+        complete = True
+        try:
+            move_into_place(work, target, log)
+        except OSError as exc:
+            # Udpakningen er hel; kun omdøbningen mangler. At smide den væk ville
+            # bare betyde 350 MB og et par minutter igen ved næste kørsel - og
+            # samme afslag. find_pinned_soffice finder den, hvor den ligger.
+            log(f"LibreOffice {LIBREOFFICE_VERSION} er pakket ud, men Windows ville "
+                f"ikke flytte mappen på plads ({exc}). Den bruges, hvor den ligger: {work}")
     finally:
         msi.unlink(missing_ok=True)
-        shutil.rmtree(work, ignore_errors=True)
+        if not complete:
+            remove_tree(work)
 
 
 def _run_installer(cmd: list[str], log, timeout: int) -> None:
