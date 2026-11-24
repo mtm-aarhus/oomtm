@@ -66,6 +66,10 @@ class Mail:
     loose_images: list = field(default_factory=list)
     #: Rigtige vedhæftede filer - kommer ikke med i PDF'en.
     attachments: list = field(default_factory=list)
+    #: Hvad tidspunktet hedder i hovedet. En .eml/.msg har afsendelsestiden;
+    #: en mail, der kun kendes fra et journalsystem, har tit kun hvornår den
+    #: blev modtaget - så hedder det "Modtaget".
+    date_label: str = "Sendt"
 
 
 def _clean(value) -> str:
@@ -437,7 +441,8 @@ def to_html(mail: Mail, *, kun_tekst: bool = False) -> str:
     ``kun_tekst`` giver mailens tekst alene, uden dens HTML og billeder - til
     når HTML'en ikke kan sættes op."""
     e = html_lib.escape
-    raekker = [("Fra", mail.sender), ("Sendt", dansk_tid(mail.date)), ("Til", mail.to),
+    raekker = [("Fra", mail.sender), (mail.date_label or "Sendt", dansk_tid(mail.date)),
+               ("Til", mail.to),
                ("Cc", mail.cc), ("Bcc", mail.bcc), ("Emne", mail.subject),
                ("Vedhæftet", "; ".join(mail.attachments))]
     hoved = "".join(f"<tr><th>{e(k)}:</th><td>{e(v)}</td></tr>" for k, v in raekker if v)

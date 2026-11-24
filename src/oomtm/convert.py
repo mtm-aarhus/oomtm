@@ -215,6 +215,49 @@ def ensure_engines(*, install: bool = True, log=None) -> dict:
             "libreoffice": pdf_mod.ensure_libreoffice(install=install, log=log)}
 
 
+def _mail_pdf(m, out_dir: Path, timeout: float, install: bool, log) -> Result:
+    """En mail (``oomtm.mail.Mail``) som PDF: hoved og tekst, ellers teksten alene."""
+    vedh = list(m.attachments)
+    pdf = _weasy_side(mail_mod.to_html(m), out_dir, "mail", timeout, install, log)
+    if _er_pdf(pdf):
+        return Result(True, pdf, "weasyprint", attachments=vedh)
+    # Mailens HTML kunne ikke sættes op (eller tog for lang tid): så
+    # hellere teksten alene end ingen PDF.
+    pdf = _weasy_side(mail_mod.to_html(m, kun_tekst=True), out_dir, "mail",
+                      timeout, install, log)
+    if _er_pdf(pdf):
+        return Result(True, pdf, "weasyprint", attachments=vedh, warnings=[
+            "Mailens opsætning kunne ikke vises, så PDF'en har kun mailens tekst, "
+            "uden billeder og formatering. Se originalen efter."])
+    return Result(False, engine="weasyprint", note="Mailen kunne ikke laves om til PDF.",
+                  attachments=vedh)
+
+
+def convert_mail(mail, out_dir, *, timeout: float = 300, install: bool = True,
+                 log=None) -> Result:
+    """En mail, der ikke er en fil, som PDF - med samme hoved som en .eml/.msg.
+
+    Til de mails, et journalsystem gemmer som tekst for sig og hoved for sig:
+    en F2-akt har mailens tekst som sit dokument, mens afsender, modtagere, emne
+    og dato står på selve akten. Konverteres dokumentet alene, mangler PDF'en
+    netop det, der gør den til en mail (2026-11-24: "make sure you add
+    to/from/cc/subject to the top of a mail, regardless if it's a mail received
+    in kontakt, or a mail fetched from f2/go/nova case").
+
+    Kalderen bygger ``mail`` (``oomtm.mail.Mail``) af systemets egne felter.
+    Kaster aldrig for en dårlig mail.
+    """
+    log = log or (lambda *_: None)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _mail_pdf(mail, out_dir, timeout, install, log)
+    except Exception as exc:  # pylint: disable=broad-except
+        log(f"oomtm.convert_mail fejlede: {exc!r}")
+        return Result(False, engine="mail",
+                      note="Mailen kunne ikke laves om til PDF.")
+
+
 def convert(src, out_dir, *, name: str | None = None, timeout: float = 300,
             install: bool = True, log=None) -> Result:
     """Lav ``src`` om til en PDF i ``out_dir``.
@@ -245,20 +288,7 @@ def convert(src, out_dir, *, name: str | None = None, timeout: float = 300,
 
         if kind == "mail":
             m = mail_mod.read_msg(src) if ext == "msg" else mail_mod.read_eml(src)
-            vedh = list(m.attachments)
-            pdf = _weasy_side(mail_mod.to_html(m), out_dir, "mail", timeout, install, log)
-            if _er_pdf(pdf):
-                return Result(True, pdf, "weasyprint", attachments=vedh)
-            # Mailens HTML kunne ikke sættes op (eller tog for lang tid): så
-            # hellere teksten alene end ingen PDF.
-            pdf = _weasy_side(mail_mod.to_html(m, kun_tekst=True), out_dir, "mail",
-                              timeout, install, log)
-            if _er_pdf(pdf):
-                return Result(True, pdf, "weasyprint", attachments=vedh, warnings=[
-                    "Mailens opsætning kunne ikke vises, så PDF'en har kun mailens tekst, "
-                    "uden billeder og formatering. Se originalen efter."])
-            return Result(False, engine="weasyprint", note="Mailen kunne ikke laves om til PDF.",
-                          attachments=vedh)
+            return _mail_pdf(m, out_dir, timeout, install, log)
 
         if kind == "html":
             tekst = mail_mod.decode_html_bytes(src.read_bytes())

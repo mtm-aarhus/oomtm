@@ -627,6 +627,120 @@ class F2:
                           "siges fra frem for at journalisere noget usynligt.")
         return akt
 
+    def add_involved(self, matter, people: list):
+        """Læg folk på akten som aktparter UDEN at fjerne nogen, der står der.
+
+        ``people`` er ``[(mail, navn), ...]``. Navnet sendes ikke til F2 - det
+        bruges kun til at genkende en, der allerede står der, hvis F2 viser
+        aktparten uden mailadresse.
+
+        HVORFOR: akterne får deres parter, når de oprettes, og dem, der kom på
+        sagen bagefter, kunne ikke se dem. En sag oprettet uden sagsbehandler fik
+        en anmodnings-akt uden parter, og den, der tog sagen, så kun de akter,
+        der kom efter (2026-11-24). Det her er vejen tilbage til de gamle akter.
+
+        Listen kan kun udskiftes hel (se ``patch``). Derfor sendes de
+        eksisterende parter med igen, og kan én af dem ikke sendes igen - F2
+        viser den kun med et navn, og et navn alene kan F2 ikke opløse - røres
+        akten ikke: den part ville forsvinde.
+
+        Kan F2 ikke opløse én af de nye (en mail, F2 ikke kender), afviser den
+        hele kaldet. Så prøves de én ad gangen, så én ukendt mail ikke holder de
+        andre ude.
+
+        Returnerer ``(akten, tilføjede_mails, afviste_mails)``. Intet at gøre er
+        ingen skrivning.
+        """
+        url = links(matter)["self"]
+        eksisterende = involved(matter)
+        mangler = []
+        for mail, navn in people:
+            mail = (mail or "").strip()
+            if mail and not _kendt_part(eksisterende, mail, navn) \
+                    and mail.lower() not in [m.lower() for m, _ in mangler]:
+                mangler.append((mail, navn or ""))
+        if not mangler:
+            return matter, [], []
+
+        beholdes = []
+        for node in eksisterende:
+            ref = party_reference(node)
+            if ref is None:
+                raise F2Error("PATCH", url, 0,
+                              f"aktparten {text(node, 'Name')!r} står på akten uden "
+                              f"mail eller partsnummer, så den kan ikke sendes med "
+                              f"igen. Listen kan kun udskiftes hel, og den ville "
+                              f"forsvinde - akten er ikke rørt. Tilføj "
+                              f"{', '.join(m for m, _ in mangler)} i F2.")
+            beholdes.append(ref)
+
+        try:
+            akt = self._saet_parter(url, beholdes, mangler, len(eksisterende))
+            return akt, [m for m, _ in mangler], []
+        except F2Error as exc:
+            if exc.status != 400 or len(mangler) == 1:
+                raise
+        # Én ad gangen. Hver vellykket kommer med i listen til den næste.
+        akt, tilfoejet, afvist = matter, [], []
+        for mail, navn in mangler:
+            try:
+                akt = self._saet_parter(url, beholdes, [(mail, navn)], len(beholdes))
+            except F2Error as exc:
+                if exc.status != 400:
+                    raise
+                self.log(f"F2 kunne ikke opløse {mail} som aktpart: {exc.message}")
+                afvist.append(mail)
+                continue
+            beholdes.append(party(email=mail))
+            tilfoejet.append(mail)
+        return akt, tilfoejet, afvist
+
+    def _saet_parter(self, url: str, beholdes: list, nye: list, foer: int):
+        """PATCH hele listen, læs akten tilbage, og kontrollér at de nye sad fast."""
+        self.patch(url, [{"op": "replace", "path": "/InvolvedParties",
+                          "value": list(beholdes) + [party(email=m) for m, _ in nye]}])
+        akt = self.get(url)
+        efter = involved(akt)
+        ikke = [m for m, n in nye if not _kendt_part(efter, m, n)]
+        # Viser F2 aktparterne uden mail, og hedder de noget andet i F2 end i
+        # KontAKT, kan de ikke genkendes. Så tælles der i stedet.
+        if ikke and len(efter) < foer + len(nye):
+            raise F2Error("PATCH", url, 200,
+                          f"aktparterne satte sig ikke ({', '.join(ikke)}). Uden "
+                          f"dem kan de ikke finde akten, så der siges fra.")
+        return akt
+
+    def ensure_responsible_unit(self, matter, party_no: int, name: str = ""):
+        """Sæt afdelingen som aktens ansvarlige, hvis det ikke er den allerede.
+
+        På ``AccessLevel=Unit`` er det den ansvarliges enhed, der kan se akten.
+        En akt oprettet, før sagen havde et team, står på reserveafdelingen
+        (OO-constanten F2AfdelingStandard), og teamet kan ikke se den. Målt
+        2026-09-07: PATCH af aktens ``/Responsible`` med ``PartyNo`` svarer 200.
+
+        Står der et partsnummer på den ansvarlige, sammenlignes der på det;
+        ellers på navnet, hvis kalderen kender afdelingens navn. Kan ingen af
+        delene afgøre det, skrives der - det er den samme værdi igen.
+
+        Bagefter kontrolleres det, at den ansvarlige stadig er en ENHED. Ellers
+        mister robotten skriveretten (se modulets docstring).
+
+        Returnerer ``(akten, blev_flyttet)``.
+        """
+        ansvarlig = matter.find("cb:Responsible", NS)
+        if ansvarlig is not None:
+            nr = text(ansvarlig, "PartyNumber") or text(ansvarlig, "PartyNo")
+            if nr and nr == str(party_no):
+                return matter, False
+            if not nr and name and text(ansvarlig, "Name").lower() == name.strip().lower():
+                return matter, False
+        url = links(matter)["self"]
+        self.patch(url, [{"op": "replace", "path": "/Responsible",
+                          "value": party(party_no=party_no)}])
+        akt = self.get(url)
+        self._kraev_enhed_som_ansvarlig(akt)
+        return akt, True
+
     def add_document(self, matter, *, title: str, filename: str, data: bytes,
                      content_type: str = "", description: str = ""):
         """En fil på akten.
@@ -937,6 +1051,114 @@ def matters(structure) -> list:
 def documents(matter) -> list:
     """Dokumenterne på en akt i en sagsstruktur."""
     return matter.findall("cb:Documents/cb:Document", NS)
+
+
+def main_document_id(matter) -> str:
+    """Id'et på aktens eget dokument - brevet, notatet, mailens tekst.
+
+    F2 oplyser det ikke som et felt, og det står IKKE blandt strukturens
+    dokumenter. Aktens ``rel/pdf-content`` peger på det
+    (``…/documents/253530/pdf-content``) - målt på tre akter, hvor hver pegede
+    på sit eget. Tom, hvis akten ikke har det link.
+    """
+    url = links(matter).get(REL + "pdf-content", "")
+    if "/documents/" not in url:
+        return ""
+    kandidat = url.split("/documents/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+    return kandidat if kandidat.isdigit() else ""
+
+
+def _part_tekst(node) -> str:
+    """"Navn <mail>", eller det af dem, der er."""
+    if node is None:
+        return ""
+    navn, mail = text(node, "Name"), text(node, "EMail")
+    if navn and mail and navn.lower() != mail.lower():
+        return f"{navn} <{mail}>"
+    return navn or mail
+
+
+def _partsliste(matter, *felter) -> str:
+    """Parterne i det første af felterne, der findes, som "A <a@x>; B <b@y>"."""
+    for felt in felter:
+        samling = matter.find(f"cb:{felt}", NS)
+        if samling is None:
+            continue
+        dele = [_part_tekst(p) for p in list(samling)]
+        if not dele and (text(samling, "Name") or text(samling, "EMail")):
+            dele = [_part_tekst(samling)]          # én part, ikke en liste
+        dele = [d for d in dele if d]
+        if dele:
+            return "; ".join(dele)
+    return ""
+
+
+# Cc har vi ikke set på en akt (KontAKT sætter den ikke). Navnene her er dem,
+# F2 kunne bruge; findes ingen af dem, står der bare ingen Cc-linje.
+_CC_FELTER = ("CcReceivers", "CCReceivers", "CarbonCopyReceivers", "CopyReceivers", "Cc")
+
+
+def mail_fields(matter) -> Optional[dict]:
+    """Aktens hoved, som det står øverst på en mail - eller None.
+
+    En mail i F2 er en akt: tekstens dokument for sig, og afsender, modtagere,
+    emne og dato på akten. Kun ind- og udgående akter med en afsender eller en
+    modtager er post; et internt notat får intet mailhoved.
+
+    Datoen er sendt for udgående og modtaget for indgående (ellers brevdatoen),
+    som F2 giver den: ISO 8601 i dansk tid uden zone. Kalderen laver den om.
+    """
+    art = text(matter, "Type")
+    if art not in (INBOUND, OUTBOUND):
+        return None
+    afsender = _part_tekst(matter.find("cb:Sender", NS))
+    til = _partsliste(matter, "Receivers")
+    if not (afsender or til):
+        return None
+    udgaaende = art == OUTBOUND
+    dato = (text(matter, "SentDate" if udgaaende else "ReceivedDate")
+            or text(matter, "LetterDate") or text(matter, "CreatedDate"))
+    return {"subject": text(matter, "Title"), "sender": afsender, "to": til,
+            "cc": _partsliste(matter, *_CC_FELTER), "date": dato,
+            "date_label": "Sendt" if udgaaende else "Modtaget"}
+
+
+def involved(matter) -> list:
+    """Aktens aktparter (``InvolvedParties``) - dem, der kan se akten ud over
+    den ansvarliges enhed."""
+    return matter.findall("cb:InvolvedParties/cb:InvolvedParty", NS)
+
+
+def party_reference(node) -> Optional[dict]:
+    """En part, som F2 viser den, som en ``PartyReference`` F2 kan opløse igen.
+
+    Bruges, når en liste af parter skal udskiftes hel, og de, der står der i
+    forvejen, skal sendes med. Mailen først: det er sådan, robotten selv satte
+    dem, så den opløses til den samme part. Partsnummeret derefter.
+
+    None, hvis noden kun har et navn - et navn alene er ikke en reference.
+    """
+    mail = text(node, "EMail")
+    if mail:
+        return party(email=mail)
+    nr = text(node, "PartyNumber") or text(node, "PartyNo")
+    if nr.isdigit():
+        return party(party_no=int(nr))
+    login = text(node, "Login")
+    if login:
+        return party(login=login)
+    return None
+
+
+def _kendt_part(nodes, mail: str, navn: str = "") -> bool:
+    """Står denne person allerede blandt parterne? Mailen, ellers navnet."""
+    mail, navn = (mail or "").strip().lower(), (navn or "").strip().lower()
+    for n in nodes:
+        if mail and text(n, "EMail").lower() == mail:
+            return True
+        if navn and text(n, "Name").lower() == navn:
+            return True
+    return False
 
 
 def parties(collection) -> list:
